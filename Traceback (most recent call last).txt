@@ -1,0 +1,200 @@
+Traceback (most recent call last):
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1963, in _exec_single_context
+    self.dialect.do_execute(
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\default.py", line 943, in do_execute
+    cursor.execute(statement, parameters)
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\cursors.py", line 153, in execute
+    result = self._query(query)
+             ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\cursors.py", line 322, in _query
+    conn.query(q)
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 563, in query
+    self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 825, in _read_query_result
+    result.read()
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 1199, in read
+    first_packet = self.connection._read_packet()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 775, in _read_packet
+    packet.raise_for_error()
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\protocol.py", line 219, in raise_for_error
+    err.raise_mysql_exception(self._data)
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\err.py", line 150, in raise_mysql_exception
+    raise errorclass(errno, errval)
+pymysql.err.ProgrammingError: (1146, "Table 'tds.source_system' doesn't exist")
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "c:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\src\AzuerApi_uqork.py", line 127, in consume_unqork
+    source_system = session.query(SourceSystem).filter_by(source_system="Unqork").first()
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\orm\query.py", line 2759, in first
+    return self.limit(1)._iter().first()  # type: ignore
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\orm\query.py", line 2857, in _iter
+    result: Union[ScalarResult[_T], Result[_T]] = self.session.execute(
+                                                  ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\orm\session.py", line 2365, in execute
+    return self._execute_internal(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\orm\session.py", line 2251, in _execute_internal
+    result: Result[Any] = compile_state_cls.orm_execute_statement(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\orm\context.py", line 306, in orm_execute_statement
+    result = conn.execute(
+             ^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1415, in execute
+    return meth(
+           ^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\sql\elements.py", line 523, in _execute_on_connection
+    return connection._execute_clauseelement(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1637, in _execute_clauseelement
+    ret = self._execute_context(
+          ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1842, in _execute_context
+    return self._exec_single_context(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1982, in _exec_single_context
+    self._handle_dbapi_exception(
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 2351, in _handle_dbapi_exception
+    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1963, in _exec_single_context
+    self.dialect.do_execute(
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\default.py", line 943, in do_execute
+    cursor.execute(statement, parameters)
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\cursors.py", line 153, in execute
+    result = self._query(query)
+             ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\cursors.py", line 322, in _query
+    conn.query(q)
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 563, in query
+    self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 825, in _read_query_result
+    result.read()
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 1199, in read
+    first_packet = self.connection._read_packet()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 775, in _read_packet
+    packet.raise_for_error()
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\protocol.py", line 219, in raise_for_error
+    err.raise_mysql_exception(self._data)
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\err.py", line 150, in raise_mysql_exception
+    raise errorclass(errno, errval)
+sqlalchemy.exc.ProgrammingError: (pymysql.err.ProgrammingError) (1146, "Table 'tds.source_system' doesn't exist")
+[SQL: SELECT source_system.df_source_system_id AS source_system_df_source_system_id, source_system.source_system AS source_system_source_system, source_system.name AS source_system_name, source_system.created_date AS source_system_created_date, source_system.modified_date AS source_system_modified_date
+FROM source_system
+WHERE source_system.source_system = %(source_system_1)s
+ LIMIT %(param_1)s]
+[parameters: {'source_system_1': 'Unqork', 'param_1': 1}]
+(Background on this error at: https://sqlalche.me/e/20/f405)
+DB Error: (pymysql.err.ProgrammingError) (1146, "Table 'tds.source_system' doesn't exist")
+[SQL: SELECT source_system.df_source_system_id AS source_system_df_source_system_id, source_system.source_system AS source_system_source_system, source_system.name AS source_system_name, source_system.created_date AS source_system_created_date, source_system.modified_date AS source_system_modified_date
+FROM source_system
+WHERE source_system.source_system = %(source_system_1)s
+ LIMIT %(param_1)s]
+[parameters: {'source_system_1': 'Unqork', 'param_1': 1}]
+(Background on this error at: https://sqlalche.me/e/20/f405)
+Traceback (most recent call last):
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1963, in _exec_single_context
+    self.dialect.do_execute(
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\default.py", line 943, in do_execute
+    cursor.execute(statement, parameters)
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\cursors.py", line 153, in execute
+    result = self._query(query)
+             ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\cursors.py", line 322, in _query
+    conn.query(q)
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 563, in query
+    self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 825, in _read_query_result
+    result.read()
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 1199, in read
+    first_packet = self.connection._read_packet()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 775, in _read_packet
+    packet.raise_for_error()
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\protocol.py", line 219, in raise_for_error
+    err.raise_mysql_exception(self._data)
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\err.py", line 150, in raise_mysql_exception
+    raise errorclass(errno, errval)
+pymysql.err.ProgrammingError: (1146, "Table 'tds.source_system' doesn't exist")
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "c:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\src\AzuerApi_uqork.py", line 275, in <module>
+    handle({"Records": [{'body': {"source_customer_id": "CUST12345","customer_name": "John Doe","submission_id": "SUBM11111","program_name": "Homeowners","product_name": "Basic Coverage","submission_status": "Open","submission_type": "New Business","effective_date": "2025-01-01T00:00:00","expiration_date": "2025-12-31T23:59:59","proposal_detail": [{"proposal_id": "QUOTE9991","proposal_status": "In Progress","proposal_effective_date": "2025-01-01T00:00:00","proposal_expiration_date": "2025-12-31T23:59:59"},{"proposal_id": "QUOTE9992","proposal_status": "Issued","proposal_effective_date": "2025-01-15T00:00:00","proposal_expiration_date": "2026-01-14T23:59:59"}]}}]}, None)
+  File "c:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\src\AzuerApi_uqork.py", line 266, in handle
+    consume_unqork(config=payload)
+  File "c:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\src\AzuerApi_uqork.py", line 257, in consume_unqork
+    raise e
+  File "c:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\src\AzuerApi_uqork.py", line 127, in consume_unqork
+    source_system = session.query(SourceSystem).filter_by(source_system="Unqork").first()
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\orm\query.py", line 2759, in first
+    return self.limit(1)._iter().first()  # type: ignore
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\orm\query.py", line 2857, in _iter
+    result: Union[ScalarResult[_T], Result[_T]] = self.session.execute(
+                                                  ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\orm\session.py", line 2365, in execute
+    return self._execute_internal(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\orm\session.py", line 2251, in _execute_internal
+    result: Result[Any] = compile_state_cls.orm_execute_statement(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\orm\context.py", line 306, in orm_execute_statement
+    result = conn.execute(
+             ^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1415, in execute
+    return meth(
+           ^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\sql\elements.py", line 523, in _execute_on_connection
+    return connection._execute_clauseelement(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1637, in _execute_clauseelement
+    ret = self._execute_context(
+          ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1842, in _execute_context
+    return self._exec_single_context(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1982, in _exec_single_context
+    self._handle_dbapi_exception(
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 2351, in _handle_dbapi_exception
+    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1963, in _exec_single_context
+    self.dialect.do_execute(
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\sqlalchemy\engine\default.py", line 943, in do_execute
+    cursor.execute(statement, parameters)
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\cursors.py", line 153, in execute
+    result = self._query(query)
+             ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\cursors.py", line 322, in _query
+    conn.query(q)
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 563, in query
+    self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 825, in _read_query_result
+    result.read()
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 1199, in read
+    first_packet = self.connection._read_packet()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\connections.py", line 775, in _read_packet
+    packet.raise_for_error()
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\protocol.py", line 219, in raise_for_error
+    err.raise_mysql_exception(self._data)
+  File "C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\venv\Lib\site-packages\pymysql\err.py", line 150, in raise_mysql_exception
+    raise errorclass(errno, errval)
+sqlalchemy.exc.ProgrammingError: (pymysql.err.ProgrammingError) (1146, "Table 'tds.source_system' doesn't exist")
+[SQL: SELECT source_system.df_source_system_id AS source_system_df_source_system_id, source_system.source_system AS source_system_source_system, source_system.name AS source_system_name, source_system.created_date AS source_system_created_date, source_system.modified_date AS source_system_modified_date
+FROM source_system
+WHERE source_system.source_system = %(source_system_1)s
+ LIMIT %(param_1)s]
+[parameters: {'source_system_1': 'Unqork', 'param_1': 1}]
+(Background on this error at: https://sqlalche.me/e/20/f405)
+(venv) PS C:\Users\A0885080\Downloads\Lineitem_script\df_das_sqs_lambdaprocessor\src>
