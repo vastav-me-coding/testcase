@@ -20,11 +20,10 @@ from secrets_manager import get_secret
 
 print("AS400 Additional Interest ETL job executing...")
 
-# --- AWS SQS Setup ---
+# --- AWS RDS + SQS Setup ---
 sqs_queue_url = os.environ["SQS_QUEUE_URL"]
 sqs = boto3.client("sqs", region_name=os.environ["AWS_REGION"])
 
-# --- AWS RDS Connection ---
 rds_secret_name = os.environ["RDS_SECRETS_MANAGER_ID"]
 region_name = os.environ["AWS_REGION"]
 rds_host = os.environ["RDS_HOST"]
@@ -35,11 +34,19 @@ session = get_rds_db_session(rds_secret_name, region_name, rds_host, rds_db)
 async def log_msg(func, **kwargs):
     await asyncio.to_thread(func, **kwargs)
 
-def call_session_engine(source_system=None):
+def call_session_engine(source_system=None, identifier=None):
     rds_secret_name = os.environ["RDS_SECRETS_MANAGER_ID"]
     region_name = os.environ["AWS_REGION"]
     rds_host_nm = os.environ['RDS_HOST']
-    rds_db_nm = os.environ['RDS_DB_NAME']
+
+    if identifier == 'ref':
+        rds_db_nm = os.environ['RDS_REF_DB_NAME']
+    elif identifier == 'raw':
+        rds_db_nm = os.environ['RDS_RAW_DB_NAME']
+    elif identifier == 'refined':
+        rds_db_nm = os.environ['RDS_REFINED_DB_NAME']
+    else:
+        rds_db_nm = os.environ['RDS_DB_NAME']
 
     if source_system.lower() == 'as400_aff':
         as400_secret_name = os.environ["AS400_AFF"]
@@ -54,23 +61,31 @@ def call_session_engine(source_system=None):
     return session, as400_engine
 
 # --- Lookup Additional Interest from AS400 ---
-def lookup_as400_additional_interest(as400_engine, config):
-    df = pd.read_sql("""
-        SELECT 
-            ai_id AS source_ai_id,
-            carrier_id,
-            name,
-            address,
-            city,
-            state,
-            zip,
-            created_ts,
-            updated_ts
-        FROM additional_interest_table   -- Replace with actual AS400 table name
-        WHERE carrier_id = :carrier_id
-    """, con=as400_engine, params={"carrier_id": config["carrier"]})
+def lookup_as400_additional_interest(config=None):
+    source_system = config['source_system']
+    if source_system:
+        if source_system.lower() in ['as400_aff', 'as400_aum']:  # extend if needed
+            df = pd.read_sql(f"""
+                SELECT 
+                    ai_id AS source_additional_interest_id,
+                    name,
+                    address,
+                    city,
+                    state,
+                    zip,
+                    created_ts AS created_date,
+                    updated_ts AS modified_date
+                FROM AS400_ADDITIONAL_INTEREST_TABLE
+            """, con=as400_engine)  # uses global as400_engine
+        else:
+            df = None
+    else:
+        df = None
 
-    return df.to_dict("records") if not df.empty else []
+    if df is not None and len(df) > 0:
+        return df.to_dict('records')[0]  # single record
+    else:
+        return None
 
 # --- Publish to SQS ---
 def publish_to_sqs(message):
@@ -87,61 +102,60 @@ def publish_to_sqs(message):
 # --- Main Consumer Function ---
 async def consume_lambda(config=None):
     try:
-        asyncio.create_task(log_msg(common_logger, log_messages="consume lambda function invoking"))
+        asyncio.create_task(log_msg(common_logger, log_messages='consume lambda function invoking'))
         now = datetime.now()
         start_timestamp = datetime.timestamp(now)
-        asyncio.create_task(log_msg(common_logger, log_messages=f"Processing @ {now}"))
+        asyncio.create_task(log_msg(common_logger, log_messages=f'Processing to DB @ {now}'))
 
         config_dicts = config if isinstance(config, list) else [json.loads(config) if isinstance(config, str) else config]
 
         for config_dict in config_dicts:
             source_system = config_dict["source_system"]
-            carrier_id = config_dict["carrier"]
+            additional_interest_id = config_dict["additional_interest"]  # 🔹 instead of carrier
 
             global session, as400_engine
             session, as400_engine = call_session_engine(source_system=source_system)
 
-            asyncio.create_task(log_msg(common_logger, log_messages=f"Fetching Additional Interest for carrier {carrier_id}"))
+            asyncio.create_task(log_msg(common_logger, log_messages=f"Fetching Additional Interest {additional_interest_id} from {source_system}"))
 
-            ai_records = lookup_as400_additional_interest(as400_engine, config_dict)
-            if ai_records:
-                for ai in ai_records:
-                    # Map Source System
-                    source_system_record = (
-                        query.first() if (query := get_record(
-                            session, model=Source_System, column_name="source_system", value=source_system)) else None
-                    )
-                    if source_system_record:
-                        ai["df_source_system_id"] = source_system_record.df_source_system_id
+            as400_ai = lookup_as400_additional_interest(config_dict)
+            if as400_ai:
+                # --- Map Source System ---
+                source_system_record = (
+                    query.first() if (query := get_record(
+                        session, model=Source_System, column_name="source_system", value=source_system)) else None
+                )
+                if source_system_record:
+                    as400_ai["df_source_system_id"] = source_system_record.df_source_system_id
 
-                    # Generate UUID
-                    df_ai_id = generate_uuid(str(ai["source_ai_id"]), ai["df_source_system_id"])
-                    ai["df_ai_id"] = df_ai_id
+                # --- Additional Interest DF ID ---
+                df_ai_id = generate_uuid(str(as400_ai["source_additional_interest_id"]), as400_ai["df_source_system_id"])
+                as400_ai["df_additional_interest_id"] = df_ai_id
 
-                    # Insert/Update Additional Interest
-                    ai_record = get_record(session, model=Additional_Interest,
-                                           column_name="source_ai_id",
-                                           value=ai["source_ai_id"],
-                                           df_source_system_id=ai["df_source_system_id"])
-                    self_ai = ai_record.first() if ai_record else None
+                # --- Check if Additional Interest already exists ---
+                ai_record = get_record(session, model=Additional_Interest,
+                                       column_name="source_additional_interest_id",
+                                       value=as400_ai["source_additional_interest_id"],
+                                       df_source_system_id=as400_ai["df_source_system_id"])
+                self_ai = ai_record.first() if ai_record else None
 
-                    if self_ai is None:
-                        session.add(Additional_Interest.from_dict(cls=Additional_Interest, d=ai))
-                        asyncio.create_task(log_msg(common_logger, log_messages=f"Inserted new Additional Interest {df_ai_id}"))
-                    else:
-                        self_ai.update(query_update_dict(obj=Additional_Interest, dict=ai))
-                        asyncio.create_task(log_msg(common_logger, log_messages=f"Updated Additional Interest {df_ai_id}"))
+                if self_ai is None:
+                    session.add(Additional_Interest.from_dict(cls=Additional_Interest, d=as400_ai))
+                    asyncio.create_task(log_msg(common_logger, log_messages=f"Inserted new Additional Interest {additional_interest_id}"))
+                else:
+                    self_ai.update(query_update_dict(obj=Additional_Interest, dict=as400_ai))
+                    asyncio.create_task(log_msg(common_logger, log_messages=f"Updated Additional Interest {additional_interest_id}"))
 
-                    session.commit()
+                session.commit()
 
-                    # Send record to SQS
-                    publish_to_sqs(ai)
+                # --- Send to SQS ---
+                publish_to_sqs(as400_ai)
 
             else:
-                asyncio.create_task(log_msg(common_logger, log_messages=f"No Additional Interest found for carrier {carrier_id}"))
+                asyncio.create_task(log_msg(common_logger, log_messages=f"No record found for Additional Interest {additional_interest_id}"))
 
         end_timestamp = datetime.timestamp(datetime.now())
-        asyncio.create_task(log_msg(common_logger, log_messages=f"Execution time: {end_timestamp - start_timestamp}"))
+        asyncio.create_task(log_msg(common_logger, log_messages=f'execution_time: {end_timestamp - start_timestamp}'))
 
     except SQLAlchemyError as e:
         session.rollback()
@@ -154,3 +168,4 @@ def handle(event, context):
         payload = record["body"]
         asyncio.run(consume_lambda(config=payload))
     return {"execution_time_sec": time.time() - start_time}
+
