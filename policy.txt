@@ -1,0 +1,208 @@
+import os
+import logging
+import json
+import time
+import requests
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import func, and_,select, BIGINT, create_engine, Column, update, Integer, cast, String, MetaData, DateTime, Float, Text, DECIMAL, TIMESTAMP, text
+from sqlalchemy.orm import Session, declarative_base
+from df_database_models.db_conn import get_rds_db_session, get_aumine_db_session
+from df_database_models.db_conn import *
+from df_database_models.models import Agency, Customer, Agency_Contact, Customer_Contact, Policy, Source_System, Policy_Status, Transaction, Transaction_Type, Policy_Number_Version
+from df_database_models.db_utils import  generate_uuid, convert_timestamps, query_update_dict, policy_version_increment, latest_policy_version, latest_transaction_id, get_record, multi_filter_get_record, push_msg_to_sqs, call_sp
+from df_database_models.db_utils import *
+from df_database_models.db_lookup import generic_product_lookup
+from secrets_manager import get_secret
+from datetime import datetime
+import pandas as pd
+import asyncio
+from adf_pyutils.clm_wrapper import common_logger, generate_response_log_details
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+pnc_db = os.environ['RDS_DB_NAME']
+ref_db = os.environ['RDS_REF_DB_NAME']
+mdm_raw_db = os.environ['RDS_RAW_DB_NAME']
+mdm_refined_db = os.environ['RDS_REFINED_DB_NAME']
+
+## Fetch SQS producer Parameters from aws secret manager
+
+async def log_msg(func,**kwargs):
+    await asyncio.to_thread(func,**kwargs)
+
+def call_session_engine(source_system=None, database_name=None):
+
+    rds_secret_name = os.environ["RDS_SECRETS_MANAGER_ID"]
+    region_name = os.environ["AWS_REGION"]
+    rds_host_nm = os.environ['RDS_HOST']
+
+    if database_name == 'ref_data':
+        rds_db_nm = os.environ['RDS_REF_DB_NAME']
+    elif database_name == 'mdm_raw':
+        rds_db_nm = os.environ['RDS_RAW_DB_NAME']
+    elif database_name == 'mdm_refined':
+        rds_db_nm = os.environ['RDS_REFINED_DB_NAME']
+    else:
+        rds_db_nm = os.environ['RDS_DB_NAME']
+
+    if source_system and source_system.lower() == 'as400_aff':
+        as400_secret_name = os.environ["AS400_AFF_SECRETS_MANAGER_ID"]
+        as400_engine = get_as400_db_session(as400_secret_name, region_name)
+        return as400_engine
+
+    elif source_system and source_system.lower() == 'as400_kkins':
+        as400_secret_name = os.environ["AS400_KKINS_SECRETS_MANAGER_ID"]
+        as400_engine = get_as400_db_session(as400_secret_name, region_name)
+        return as400_engine
+
+    if database_name:
+        session = get_rds_db_session(rds_secret_name, region_name, rds_host_nm, rds_db_nm)
+        return session
+
+
+# --- Global Sessions ---
+session = call_session_engine(database_name=pnc_db)
+as400_engine_aff = call_session_engine(source_system='as400_aff')
+as400_engine_kkins = call_session_engine(source_system='as400_kkins')
+
+def lookup_as400(config=None, id=None, engine=None):
+    source_system = config['source_system']
+    if source_system:
+        if source_system.lower() == 'as400_aff':
+            df = pd.read_sql(f"""
+                SELECT * FROM (
+                    SELECT
+                        ROW_NUMBER() OVER (
+                            PARTITION BY a.ACCOUNT_NO
+                            ORDER BY c.ENDORSEMENT_SEQ_NO DESC
+                        ) AS row_num,
+                        a.ACCOUNT_NO AS policy_number,
+                        c.ENDORSEMENT_NO AS endorsement_number,
+                        c.ENDORSEMENT_SEQ_NO AS endorsement_sequence_number,
+                        CASE
+                            WHEN a.ENTITY_STATUS = 'A' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'T' THEN 'Terminated'
+                            WHEN a.ENTITY_STATUS = 'R' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'P' THEN 'Pending'
+                            WHEN a.ENTITY_STATUS = 'Q' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'Z' THEN 'Terminated'
+                        END AS source_policy_status,
+                        CASE
+                            WHEN (a.PROFESSION_FLAG IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE = 'I') THEN '71a7b727-0787-4935-a0d0-0704dbcdd711'
+                            WHEN (a.PROFESSION_FLAG IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE != 'I') THEN 'e71ba4fc-afa1-4396-a8ef-c7a22765adb8'
+                            WHEN (a.PROFESSION_FLAG NOT IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE != 'I') THEN '2bd40533-6f37-4239-bfbf-8f22feddbb2e'
+                            WHEN (a.PROFESSION_FLAG NOT IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE = 'I') THEN 'f84e4b29-8069-45b5-8e46-835cf590a569'
+                            WHEN a.POLICY_TYPE = 'U' THEN '5b0f4296-767c-4196-bd10-d13d2fc68ad8'
+                        END AS product_id,
+                        TRIM(a.SUBPROD_NO) AS source_agency_id,
+                        a.CUSTOMER_NO AS source_customer_id,
+                        a.POLICY_EFF_DATE AS effective_date,
+                        a.POLICY_EXP_DATE AS expiration_date,
+                        b.POLICY_ISSUE_DATE AS policy_issue_date,
+                        'AS400_AFFDEV' AS source_system
+                    FROM dm_stelo.ADGDTADV_NSOCVGP a
+                    INNER JOIN dm_stelo.ADGDTADV_ADGACIP b ON a.CUSTOMER_NO = b.CUSTOMER_NO
+                    INNER JOIN dm_stelo.ADGDTADV_HCPCVEP c 
+                        ON a.CUSTOMER_NO = c.CUSTOMER_NO 
+                        AND a.POLICY_EFF_DATE = c.EFFECTIVE_DATE
+                        AND a.POLICY_EXP_DATE = c.TERMIN_DATE
+                    WHERE a.POLICY_EFF_DATE <= DATE_FORMAT(NOW(), '%Y%m%d')
+                    AND a.POLICY_EXP_DATE > DATE_FORMAT(NOW(), '%Y%m%d')
+                    AND a.ENTITY_STATUS = 'A'
+                ) ab
+                WHERE row_num = 1 AND {"source_customer_id" if "source_customer_id" in config else "policy_number"} = {id}
+            """, con=as400_engine)
+    else:
+        df=None
+
+    if(len(df)>0):
+        return df.to_dict('records')[0]
+    else:
+        return None
+
+def consume_as400_lambda(config=None):
+    now = datetime.now()
+    start_timestamp = datetime.timestamp(now)
+    asyncio.create_task(log_msg(common_logger,log_messages=f'Processing to DB @ {now} | {datetime.timestamp(now)}'))
+    try:
+        logger.info(config)
+        config_dicts = config if type(config) is dict else json.loads(str(config))
+        if type(config_dicts) == list:
+            pass
+        else:
+            config_dicts = [config_dicts]
+        for config_dict in config_dicts:
+            id = config_dict['source_customer_id'] if 'source_customer_id' in config_dict else config_dict['source_policy_id']
+            source_system = config_dict['source_system'].lower()
+
+            global as400_engine
+            if source_system == "as400_aff":
+                as400_engine = as400_engine_aff
+            elif source_system == "as400_kkins":
+                as400_engine = as400_engine_kkins
+
+            if(id):
+                print("Calling call_session_engine Function")
+
+                as400_policy_summary_dict = lookup_as400(config=config_dict, id=id, engine=session)
+                print(as400_policy_summary_dict)
+
+                if not  as400_policy_summary_dict:
+                    asyncio.create_task(log_msg(common_logger, log_messages='No AS400 record found'))
+                    continue
+
+                asyncio.create_task(log_msg(common_logger, log_messages='Fetched AS400 Policy Record', api_response= as400_policy_summary_dict))
+
+                # Fetch source_system_id from DF
+                src_sys =  as400_policy_summary_dict['source_system']
+                src_record = get_record(session, model=Source_System, column_name='source_system', value=src_sys)
+                src_record = src_record.first() if src_record else None
+                if src_record:
+                    as400_policy_summary_dict['df_source_system_id'] = src_record.df_source_system_id
+
+                # Lookup policy
+                policy_record = get_record(session, model=Policy,
+                                        column_name='policy_number',
+                                        value= as400_policy_summary_dict.get('policy_number'),
+                                        df_source_system_id= as400_policy_summary_dict.get('df_source_system_id'))
+                existing_policy = policy_record.first() if policy_record else None
+
+                if existing_policy is None:
+                    as400_policy_summary_dict['df_policy_id'] = generate_uuid(str( as400_policy_summary_dict['policy_number']),  as400_policy_summary_dict['df_source_system_id'])
+                    asyncio.create_task(log_msg(common_logger, log_messages='Inserting new Policy', api_response= as400_policy_summary_dict))
+                    session.add(Policy.from_dict(cls=Policy, d= as400_policy_summary_dict))
+                    session.commit()
+                else:
+                    as400_policy_summary_dict['df_policy_id'] = existing_policy.df_policy_id
+                    asyncio.create_task(log_msg(common_logger, log_messages='Updating existing Policy', api_response= as400_policy_summary_dict))
+                    policy_record.update(query_update_dict(obj=Policy, dict= as400_policy_summary_dict))
+                    session.commit()
+
+        now = datetime.now()
+        end_timestamp = datetime.timestamp(now)
+        return {'execution_time': end_timestamp - start_timestamp}
+    except SQLAlchemyError as e:
+        # asyncio.create_task(log_msg(common_logger,log_messages='Error',api_response=e))
+        session.rollback()
+        raise e
+
+def handle(event, context):
+    start_time = time.time()
+    for record in event['Records']:
+        logger.info(record)
+        payload = record["body"]
+        # asyncio.run(consume_lambda(config=payload))
+        consume_as400_lambda(config=payload)
+
+    end_time = time.time()
+
+    return {
+        "execution_time_sec": end_time - start_time 
+    }
+
+
+#if __name__ == '__main__':
+    #handle({'Records': [{'body': '{"source_policy_id":"1003093977","event_type":"INSERT/DELETE"}'}]}, None)
+    # handle({'Records': [{'body': '[{ "source_policy_id": "2002569486", "parent_policy_id": "2002254485", "policy_type": "renewal"}]'}]}, None)
+    # handle({'Records': [{'body': '[{"source_policy_id":"2002573640"},{"source_policy_id":"2002573647"},{"source_policy_id":"2002573649"}]'}]}, None)
