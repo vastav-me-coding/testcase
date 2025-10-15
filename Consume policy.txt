@@ -1,0 +1,354 @@
+async def consume_lambda(config=None):
+    now = datetime.now()
+    start_timestamp = datetime.timestamp(now)
+    asyncio.create_task(log_msg(common_logger,log_messages=f'Processing to DB @ {now} | {datetime.timestamp(now)}'))
+    try:
+        logger.info(config)
+        config_dicts = config if type(config) is dict else json.loads(str(config))
+        if type(config_dicts) == list:
+            pass
+        else:
+            config_dicts = [config_dicts]
+        for config_dict in config_dicts:
+            id = config_dict['source_policy_id']
+            source_system = config_dict['source_system'].lower()
+            asyncio.create_task(log_msg(common_logger,log_messages=f'Handle function is Invoking for Policy {source_system} System'))    
+            if(id):
+                fk_flag = 1
+                print("Calling call_session_engine Function ")
+                global session, aumine_engine
+                aumine_engine = call_session_engine(source_system=source_system)
+                session = call_session_engine(database_name=pnc_db)
+
+                aumine_policy_summary_dict = lookup_aumine(config=config_dict, id=id)
+                if(aumine_policy_summary_dict):
+                    #asyncio.create_task(log_msg(common_logger,log_messages=f'Initial {source_system} Policy Summary dict:',api_response=convert_timestamps(aumine_policy_summary_dict)))
+                    
+                    ## Fetch Source SyStem Id from Data Foundation
+                    aumine_policy_summary_dict['source_system'] = source_system
+                    policy_status = aumine_policy_summary_dict.get("policy_status")
+                    transaction_type = aumine_policy_summary_dict.get("transaction_type")
+                    source_transaction_id = aumine_policy_summary_dict.get("source_transaction_id")
+                    source_system_record = (query.first() if (query := multi_filter_get_record(session,model=Source_System,source_system=source_system)) is not None else None)
+                    policy_status_record = (query.first() if (query := multi_filter_get_record(session,model=Policy_Status,policy_status=policy_status)) is not None else None)                   
+                    transaction_type_record = (query.first() if (query := multi_filter_get_record(session,model=Transaction_Type,transaction_type=transaction_type)) is not None else None)
+
+                    if source_system_record:
+                        aumine_policy_summary_dict['df_source_system_id'] = source_system_record.df_source_system_id
+                    if policy_status_record:
+                        aumine_policy_summary_dict['df_policy_status_id'] = policy_status_record.df_policy_status_id
+                    if transaction_type_record:
+                        aumine_policy_summary_dict['df_transaction_type_id'] = transaction_type_record.df_transaction_type_id
+
+                    #Assign a variable to prev_policy_no,source_system_id  and source_transaction_type from Dictionary Object
+                    previous_policy_number = aumine_policy_summary_dict.get("previous_policy_number")                  
+                    df_source_system_id = aumine_policy_summary_dict.get("df_source_system_id")
+                    source_transaction_type = aumine_policy_summary_dict.get("source_transaction_type")
+                    current_policy_number = aumine_policy_summary_dict.get("policy_number")
+                    sequence_id = aumine_policy_summary_dict.get("sequence_id")
+                    endorses = aumine_policy_summary_dict.get("endorses")
+                    aumine_policy_summary_dict['parent_policy_number'] = None
+
+                    if source_transaction_type != 'New':
+                        #transaction_record = get(entity=Transaction,policy_number=previous_policy_number, df_source_system_id=df_source_system_id).first()
+                        if previous_policy_number:
+                            policy_version_row = (query.first() if (query := multi_filter_get_record(session,model=Policy_Number_Version,policy_number=previous_policy_number)) is not None else None)
+                            if policy_version_row:
+                                df_policy_id = policy_version_row.df_policy_id
+                                df_policy_record = (query.first() if (query := multi_filter_get_record(session,model=Policy,df_policy_id=df_policy_id, df_source_system_id=df_source_system_id)) is not None else None)
+                                if df_policy_record:
+                                    aumine_policy_summary_dict['parent_policy_number'] = df_policy_record.policy_number
+                        elif previous_policy_number is None and (sequence_id is None and endorses is None) :
+                            aumine_policy_summary_dict['parent_policy_number'] = aumine_policy_summary_dict.get("policy_number")
+                    else:
+                        aumine_policy_summary_dict['parent_policy_number'] = aumine_policy_summary_dict.get("policy_number") 
+
+                    asyncio.create_task(log_msg(common_logger,log_messages=f'Transactional {source_system} Policy Summary dict:',api_response=convert_timestamps(aumine_policy_summary_dict)))
+                    
+                    if aumine_policy_summary_dict['parent_policy_number'] is None:
+                        aumine_policy_summary_dict['parent_policy_number'] = aumine_policy_summary_dict.get("policy_number")
+
+                    #Assign a variable to Policy_number,Agency_id and Customer_id from Dictionary Object
+                    parent_policy_number = aumine_policy_summary_dict.get("parent_policy_number")  
+                    source_agency_id = aumine_policy_summary_dict.get("source_agency_id")
+                    source_agency_contact_id = aumine_policy_summary_dict.get("source_agency_contact_id")
+                    source_customer_id = aumine_policy_summary_dict.get("source_customer_id")
+                    source_customer_contact_id = aumine_policy_summary_dict.get("source_customer_contact_id")              
+
+                    #Fetch policy_number Agency_id and Customer_id from Data Foundation
+                    policy_record = multi_filter_get_record(session,model=Policy,policy_number=parent_policy_number,df_source_system_id=df_source_system_id)
+                    source_transaction_record = multi_filter_get_record(session,model=Transaction,source_transaction_id=source_transaction_id, df_source_system_id=df_source_system_id)
+                    policy_version_record = multi_filter_get_record(session,model=Policy_Number_Version,policy_number=current_policy_number)
+                    agency_record = (query.first() if (query := multi_filter_get_record(session,model=Agency,source_agency_id=source_agency_id, df_source_system_id=df_source_system_id)) is not None else None)
+                    agency_contact_record = (query.first() if (query := multi_filter_get_record(session,model=Agency_Contact,source_agency_contact_id=source_agency_contact_id, df_source_system_id=df_source_system_id)) is not None else None)
+                    customer_record = (query.first() if (query := multi_filter_get_record(session,model=Customer,source_customer_id=source_customer_id, df_source_system_id=df_source_system_id)) is not None else None)
+                    customer_contact_record = (query.first() if (query := multi_filter_get_record(session,model=Customer_Contact,source_customer_contact_id=source_customer_contact_id, df_source_system_id=df_source_system_id)) is not None else None)
+                     
+                    self_policy = (policy_record.first() if policy_record is not None else None)
+                    self_transaction = (source_transaction_record.first() if source_transaction_record is not None else None)
+                    self_policy_version = (policy_version_record.first() if policy_version_record is not None else None)
+                    # session.commit() 
+                    asyncio.create_task(log_msg(common_logger,log_messages=f'self policy - {self_policy}'))
+                    asyncio.create_task(log_msg(common_logger,log_messages=f'Changed {source_system} Policy Summary dict:',api_response=convert_timestamps(aumine_policy_summary_dict)))
+
+                    if agency_record:
+                        asyncio.create_task(log_msg(common_logger,log_messages=f' Found Valid Agency Record from Agency entity : {agency_record}'))
+                        aumine_policy_summary_dict['df_agency_id'] = agency_record.df_agency_id                            
+                    else:
+                        if source_agency_id is not None:
+                            asyncio.create_task(log_msg(common_logger,log_messages=f'source_agency_id contains a valid value : {source_agency_id}'))
+                            aumine_policy_summary_dict['df_agency_id'] = generate_uuid(str(source_agency_id or ''), 
+                                                                                        str(df_source_system_id))
+                            session.add(Agency.from_dict(cls=Agency, d=aumine_policy_summary_dict))
+                            session.commit()
+
+                            #init_sp(source_system=source_system,identifier='Agency', id=source_agency_id)
+
+                    if agency_contact_record:
+                        asyncio.create_task(log_msg(common_logger,log_messages=f' Found Valid Agency Contact Record from Agency_Contact entity : {agency_contact_record}'))
+                        aumine_policy_summary_dict['df_agency_contact_id'] = agency_contact_record.df_agency_contact_id
+                    else:
+                        if source_agency_contact_id is not None:
+                            asyncio.create_task(log_msg(common_logger,log_messages=f'source_agency_contact_id contains a valid value : {source_agency_contact_id}'))
+                            aumine_policy_summary_dict['df_agency_contact_id'] = generate_uuid(str(source_agency_contact_id or ''),
+                                                                                                str(df_source_system_id))
+                            session.add(Agency_Contact.from_dict(cls=Agency_Contact, d=aumine_policy_summary_dict))
+                            session.commit()
+                            #init_sp(source_system=source_system,identifier='Agency_Contact', id=source_agency_contact_id)
+
+                    if customer_record:
+                        asyncio.create_task(log_msg(common_logger,log_messages=f' Found Valid Customer Record from Customer entity : {customer_record}'))
+                        aumine_policy_summary_dict['df_customer_id'] = customer_record.df_customer_id
+                    else:
+                        if source_customer_id is not None:
+                            asyncio.create_task(log_msg(common_logger,log_messages=f'source_customer_id contains a valid value : {source_customer_id}'))
+                            aumine_policy_summary_dict['df_customer_id'] = generate_uuid(str(source_customer_id or ''),
+                                                                                            str(df_source_system_id))
+                            session.add(Customer.from_dict(cls=Customer, d=aumine_policy_summary_dict))
+                            session.commit()
+                            asyncio.create_task(log_msg(common_logger,log_messages=f'Successfully inserted record into Customer Data Foundation Entity : {source_customer_id}'))
+                            #init_sp(source_system=source_system,identifier='Customer', id=source_customer_id)
+                    
+                    if customer_contact_record:
+                        asyncio.create_task(log_msg(common_logger,log_messages=f' Found Valid Customer Contact Record from Customer Contact entity : {customer_contact_record}'))
+                        aumine_policy_summary_dict['df_customer_contact_id'] = customer_contact_record.df_customer_contact_id
+                    else:
+                        if source_customer_contact_id is not None:
+                            asyncio.create_task(log_msg(common_logger,log_messages=f'source_customer_contact_id contains a valid value : {source_customer_contact_id}'))
+                            aumine_policy_summary_dict['df_customer_contact_id'] = generate_uuid(str(source_customer_contact_id or ''),
+                                                                                            str(df_source_system_id))
+                            session.add(Customer_Contact.from_dict(cls=Customer_Contact, d=aumine_policy_summary_dict))
+                            session.commit()
+                            asyncio.create_task(log_msg(common_logger,log_messages=f'Successfully inserted record into Customer_Contact Data Foundation Entity : {source_customer_id}'))
+                            
+                            #init_sp(source_system=source_system,identifier='Customer_Contact', id=source_customer_contact_id)                    
+                                       
+                    if(self_policy is None):
+                        asyncio.create_task(log_msg(common_logger,log_messages=f"no policy was found in Data Foundation Schema"))
+                        aumine_policy_summary_dict['df_policy_id'] = generate_uuid(parent_policy_number, str(df_source_system_id))
+
+                        #Fetching product_id by matching with policy_id and business unit
+                        aumine_product_summary_dict = generic_product_lookup(aumine_conn_str=aumine_engine,source_system=source_system,p_id=id)
+                        asyncio.create_task(log_msg(common_logger,log_messages=f'Changed {source_system} Product Summary dict:',api_response=convert_timestamps(aumine_product_summary_dict)))
+                        if aumine_product_summary_dict:
+                            if aumine_product_summary_dict.get("product_id"):
+                                aumine_policy_summary_dict['product_id'] = aumine_product_summary_dict.get("product_id")
+                            else:
+                                asyncio.create_task(log_msg(common_logger,log_messages=f" -- No Product ID Found -> populate default Product UUID value -- "))
+                                aumine_policy_summary_dict['product_id'] = generate_uuid(str(''), str(df_source_system_id))
+                                #aumine_policy_summary_dict['product_id'] = None                            
+                                #fk_flag = 0
+                        else:
+                            asyncio.create_task(log_msg(common_logger,log_messages=f" -- No Product ID Found -> populate default Product UUID value --- "))
+                            aumine_policy_summary_dict['product_id'] = generate_uuid(str(''), str(df_source_system_id))
+                            #aumine_policy_summary_dict['product_id'] = None                            
+                            #fk_flag = 0
+
+                        asyncio.create_task(log_msg(common_logger,log_messages=f'Insert {source_system} Policy Summary dict:',api_response=convert_timestamps(aumine_policy_summary_dict)))
+                        print(f"Insert {source_system} Policy Summary dict: {aumine_policy_summary_dict}")
+                        if fk_flag==0:
+                            session.execute(text("SET FOREIGN_KEY_CHECKS = 0;"))
+                            asyncio.create_task(log_msg(common_logger,log_messages='FK disabled'))
+
+                        session.add(Policy.from_dict(cls=Policy, d=aumine_policy_summary_dict))
+                        session.commit()
+
+                        if fk_flag==0:
+                            session.execute(text("SET FOREIGN_KEY_CHECKS = 1;"))
+                            asyncio.create_task(log_msg(common_logger,log_messages='FK Enabled'))
+                            session.commit()
+                            fk_flag = 1
+                        asyncio.create_task(log_msg(common_logger,log_messages=f'Inserted Policy data to  Data Foundation DB @ {now} | {datetime.timestamp(now)}'))
+
+                    elif(self_policy is not None):
+                        asyncio.create_task(log_msg(common_logger,log_messages=f" -- Policy exists in Data foundation schema -- "))
+                        aumine_policy_summary_dict['df_policy_id'] = self_policy.df_policy_id
+                        aumine_policy_summary_dict['product_id'] = self_policy.product_id
+                        #aumine_policy_summary_dict['df_agency_contact_id'] = self_policy.df_agency_contact_id
+                        #aumine_policy_summary_dict['df_customer_id'] = self_policy.df_customer_id
+                        #aumine_policy_summary_dict['df_customer_contact_id'] = self_policy.df_customer_contact_id
+                        #aumine_policy_summary_dict['df_agency_id'] = self_policy.df_agency_id
+                        aumine_policy_summary_dict['policy_number'] = self_policy.policy_number
+                        aumine_policy_summary_dict['policy_issue_date'] = str(self_policy.policy_issue_date) if self_policy.policy_issue_date is not None else None
+
+                        asyncio.create_task(log_msg(common_logger,log_messages=f'Updated {source_system} Policy Summary dict:',api_response=convert_timestamps(aumine_policy_summary_dict)))
+                        policy_record.update(query_update_dict(obj=Policy, dict=aumine_policy_summary_dict))
+                        session.commit()
+                        asyncio.create_task(log_msg(common_logger,log_messages=f' -- Updated Policy data to Data Foundation DB @ {now} | {datetime.timestamp(now)} -- ')) 
+          
+                    if self_transaction is None:
+                        fk_flag=0
+                        asyncio.create_task(log_msg(common_logger,log_messages=f"no Policy Transactional record was found in Data Foundation Schema"))
+                        aumine_policy_summary_dict['df_transaction_id'] = generate_uuid(str(source_transaction_id or '') +
+                                                                                        str(parent_policy_number or '') ,
+                                                                                    str(df_source_system_id))                                                
+                        if fk_flag==0:
+                            session.execute(text("SET FOREIGN_KEY_CHECKS = 0;"))
+                            asyncio.create_task(log_msg(common_logger,log_messages='FK disabled'))
+
+                        session.add(Transaction.from_dict(cls=Transaction, d=aumine_policy_summary_dict))
+                        session.commit()
+
+                        if fk_flag==0:
+                            session.execute(text("SET FOREIGN_KEY_CHECKS = 1;"))
+                            asyncio.create_task(log_msg(common_logger,log_messages='FK Enabled'))
+                            session.commit()
+                            fk_flag = 1
+                        asyncio.create_task(log_msg(common_logger,log_messages=f' -- Inserted Transaction data to Data Foundation DB @ {now} | {datetime.timestamp(now)} -- '))       
+
+                    elif self_transaction is not None:
+                        asyncio.create_task(log_msg(common_logger,log_messages=f" -- Policy Transaction Record exists in Data foundation schema -- "))
+                        aumine_policy_summary_dict['df_transaction_id'] = self_transaction.df_transaction_id
+                        asyncio.create_task(log_msg(common_logger,log_messages=f'Updated Transaction {source_system} Policy Summary dict:',api_response=convert_timestamps(aumine_policy_summary_dict)))
+                        source_transaction_record.update(query_update_dict(obj=Transaction, dict=aumine_policy_summary_dict))
+                        session.commit()
+                        asyncio.create_task(log_msg(common_logger,log_messages=f' -- Updated Transaction data to Data Foundation DB @ {now} | {datetime.timestamp(now)} -- ')) 
+
+                    if self_transaction or self_transaction is None:
+                        df_policy_id = aumine_policy_summary_dict['df_policy_id']
+                        asyncio.create_task(log_msg(common_logger,log_messages=f" -- Set is_latest and is_future tags for the specific df_policy_id : {df_policy_id}  to None -- "))
+                        is_lastest_future_stmt = (update(Transaction)
+                                        .where(Transaction.df_policy_id == df_policy_id)
+                                        .values(is_latest_transaction=None, is_future_transaction=None)
+                                        )
+                        session.execute(is_lastest_future_stmt)
+                        session.commit()
+
+                        is_latest_max_transaction_id,is_future_max_transaction_id = latest_transaction_id(event=session,df_policy_id=df_policy_id)
+                        
+                        if is_latest_max_transaction_id:
+                            asyncio.create_task(log_msg(common_logger,log_messages=f" -- Set is_latest flag to 1 for the latest source Transaction Id -- "))
+                            is_latest_update_stmt = (update(Transaction)
+                                            .where(and_(Transaction.df_policy_id == df_policy_id, 
+                                                Transaction.effective_date <= func.current_date(),
+                                                Transaction.source_transaction_id == is_latest_max_transaction_id))
+                                            .values(is_latest_transaction=1)
+                                            )
+                            session.execute(is_latest_update_stmt)
+                            session.commit()
+                        
+                        if is_future_max_transaction_id:
+                            asyncio.create_task(log_msg(common_logger,log_messages=f" -- Set is_future flag to 1 for the latest source Transaction Id -- "))
+                            is_future_update_stmt = (update(Transaction)
+                                            .where(and_(Transaction.df_policy_id == df_policy_id, 
+                                                Transaction.effective_date > func.current_date(),
+                                                Transaction.source_transaction_id == is_future_max_transaction_id))
+                                            .values(is_latest_transaction=1)
+                                            )
+                            session.execute(is_future_update_stmt)
+                            session.commit()
+                                                                                
+                        session.commit()
+
+                    if self_policy_version is None:
+                        asyncio.create_task(log_msg(common_logger,log_messages=f" -- No Policy Version record was found in Data Foundation Schema -- "))
+                        df_policy_id = aumine_policy_summary_dict['df_policy_id']
+                        aumine_policy_summary_dict['policy_number'] = current_policy_number
+                        aumine_policy_summary_dict['df_policy_number_version_id'] = generate_uuid(str(current_policy_number or '') +
+                                                                                                  str(df_policy_id or '') +
+                                                                                        str(df_source_system_id))                        
+                    
+                        policy_version = latest_policy_version(event=session,entity=Policy_Number_Version, df_policy_id=df_policy_id).first()
+                        print("policy_version is : ", policy_version)
+                        if policy_version is not None:
+                            aumine_policy_summary_dict['policy_version_number'] = policy_version_increment(policy_version.policy_version_number)
+                        else:
+                            policy_version_number = None
+                            aumine_policy_summary_dict['policy_version_number'] = policy_version_increment(policy_version_number)
+
+                        aumine_policy_summary_dict['policy_effective_date'] = aumine_policy_summary_dict['effective_date']
+                        aumine_policy_summary_dict['policy_expiration_date'] = aumine_policy_summary_dict['expiration_date']
+                        aumine_policy_summary_dict['is_latest'] = 0
+
+                        asyncio.create_task(log_msg(common_logger,log_messages=f'Insert {source_system} Policy Version Summary dict:',api_response=convert_timestamps(aumine_policy_summary_dict)))
+                        print("Insert Aumine_AFF Policy Version Summary dict: ", aumine_policy_summary_dict )
+
+                        session.add(Policy_Number_Version.from_dict(cls=Policy_Number_Version, d=aumine_policy_summary_dict))
+                        session.commit()  
+
+                        policy_version_latest = latest_policy_version(event=session,entity=Policy_Number_Version, df_policy_id=df_policy_id).first()
+                        
+                        #Set all records for the specific df_policy_id  to 0
+                        asyncio.create_task(log_msg(common_logger,log_messages=f" -- Set all records for the specific df_policy_id : {df_policy_id}  to 0 -- "))
+                        session.execute(update(Policy_Number_Version)
+                                        .where(Policy_Number_Version.df_policy_id == df_policy_id)
+                                        .values(is_latest=0)
+                                        )
+                        #Set only the latest record for the specific df_policy_id to 1
+                        asyncio.create_task(log_msg(common_logger,log_messages=f" -- Set all records for the specific df_policy_id : {df_policy_id}  to 1 -- "))
+                        session.execute(update(Policy_Number_Version)
+                                        .where(Policy_Number_Version.df_policy_id == df_policy_id,Policy_Number_Version.policy_version_number == policy_version_latest.policy_version_number )
+                                        .values(is_latest=1)
+                                        )  
+                        
+                        session.commit()  
+
+                    elif self_policy_version is not None:
+                        asyncio.create_task(log_msg(common_logger,log_messages=f" -- Policy Version record was found in Data Foundation Schema -- "))
+
+                        aumine_policy_summary_dict['df_policy_number_version_id'] = self_policy_version.df_policy_number_version_id
+                        aumine_policy_summary_dict['policy_number'] = current_policy_number
+                        aumine_policy_summary_dict['policy_version_number'] = self_policy_version.policy_version_number
+                        aumine_policy_summary_dict['policy_effective_date'] = str(self_policy_version.policy_effective_date) if self_policy_version.policy_effective_date is not None else None
+                        aumine_policy_summary_dict['policy_expiration_date'] = aumine_policy_summary_dict['expiration_date']
+                        aumine_policy_summary_dict['is_latest'] = self_policy_version.is_latest              
+
+                        asyncio.create_task(log_msg(common_logger,log_messages=f'Updated {source_system} Policy Version Summary dict:',api_response=convert_timestamps(aumine_policy_summary_dict)))
+                        policy_version_record.update(query_update_dict(obj=Policy_Number_Version, dict=aumine_policy_summary_dict))
+                        session.commit()
+
+                    # Calling A producer API to send Id's to MDM RAW Layer
+                    if source_agency_id is not None:
+                        asyncio.create_task(log_msg(common_logger,log_messages=f'source_agency_id contains a valid value : {source_agency_id}'))
+                        #init_sp(source_system=source_system,identifier='Agency', id=source_agency_id)
+                        msg_to_sqs(source_system=source_system,identifier='Agency', id=source_agency_id)
+                        asyncio.create_task(log_msg(common_logger,log_messages=f'Successfully pushed the message to MDM Agency Consumer Lambda Queue : {source_agency_id}'))
+
+                    if source_agency_contact_id is not None:
+                        asyncio.create_task(log_msg(common_logger,log_messages=f'source_agency_contact_id contains a valid value : {source_agency_contact_id}'))
+                        #init_sp(source_system=source_system,identifier='Agency_Contact', id=source_agency_contact_id)
+                        #msg_to_sqs(source_system=source_system,identifier='Agency_Contact', id=source_agency_contact_id)
+
+                    if source_customer_id is not None:
+                        asyncio.create_task(log_msg(common_logger,log_messages=f'source_customer_id contains a valid value : {source_customer_id}'))
+                        #init_sp(source_system=source_system,identifier='Customer', id=source_customer_id)
+                        #msg_to_sqs(source_system=source_system,identifier='Customer', id=source_customer_id)
+
+                    if source_customer_contact_id is not None:
+                        asyncio.create_task(log_msg(common_logger,log_messages=f'source_customer_contact_id contains a valid value : {source_customer_contact_id}'))
+                        #init_sp(source_system=source_system,identifier='Customer_Contact', id=source_customer_contact_id)  
+                        #msg_to_sqs(source_system=source_system,identifier='Customer_Contact', id=source_customer_contact_id)    
+
+            else:
+                    error_log = {
+                        "source_policy_id" : id,
+                        "error_message" : "No record found after lookup" 
+                    }
+                    asyncio.create_task(log_msg(common_logger,log_messages=f'No record found after lookup - {error_log}'))
+        now = datetime.now()
+        end_timestamp = datetime.timestamp(now)
+        return {'execution_time': end_timestamp - start_timestamp}
+    except SQLAlchemyError as e:
+        asyncio.create_task(log_msg(common_logger,log_messages='Error',api_response=e))
+        session.rollback()
+        raise e
