@@ -1,0 +1,255 @@
+import os
+import logging
+import json
+import time
+import pandas as pd
+import asyncio
+from datetime import datetime
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import and_
+
+# --- DF imports ---
+from df_database_models.db_conn import get_rds_db_session, get_as400_db_session
+from df_database_models.models import (
+    Transaction_Coverage,
+    Transaction,
+    Coverage
+)
+from df_database_models.db_utils import (
+    generate_uuid,
+    convert_timestamps,
+    query_update_dict,
+    get_record,
+    multi_filter_get_record
+)
+from adf_pyutils.clm_wrapper import common_logger, generate_response_log_details
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# --- Global DB config ---
+pnc_db = os.environ['RDS_DB_NAME']
+
+# ------------------------------------------------------------
+# Logging helper
+# ------------------------------------------------------------
+async def log_msg(func, **kwargs):
+    await asyncio.to_thread(func, **kwargs)
+
+# ------------------------------------------------------------
+# Session creation
+# ------------------------------------------------------------
+def call_session_engine(source_system=None, database_name=None):
+    rds_secret_name = os.environ["RDS_SECRETS_MANAGER_ID"]
+    region_name = os.environ["AWS_REGION"]
+    rds_host_nm = os.environ['RDS_HOST']
+
+    if database_name:
+        if database_name == 'ref_data':
+            rds_db_nm = os.environ['RDS_REF_DB_NAME']
+        elif database_name == 'mdm_raw':
+            rds_db_nm = os.environ['RDS_RAW_DB_NAME']
+        elif database_name == 'mdm_refined':
+            rds_db_nm = os.environ['RDS_REFINED_DB_NAME']
+        else:
+            rds_db_nm = os.environ['RDS_DB_NAME']
+    else:
+        rds_db_nm = os.environ['RDS_DB_NAME']
+
+    if source_system and source_system.lower() == 'as400_aff':
+        as400_secret_name = os.environ["AS400_AFF_SECRETS_MANAGER_ID"]
+        return get_as400_db_session(as400_secret_name, region_name)
+
+    elif source_system and source_system.lower() == 'as400_kkins':
+        as400_secret_name = os.environ["AS400_KKINS_SECRETS_MANAGER_ID"]
+        return get_as400_db_session(as400_secret_name, region_name)
+
+    elif source_system and source_system.lower() == 'as400_attorney':
+        as400_secret_name = os.environ["AS400_KKINS_SECRETS_MANAGER_ID"]
+        return get_as400_db_session(as400_secret_name, region_name)
+
+    return get_rds_db_session(rds_secret_name, region_name, rds_host_nm, rds_db_nm)
+
+
+# --- Global Sessions ---
+session = call_session_engine(database_name=pnc_db)
+as400_engine_aff = call_session_engine(source_system='as400_aff')
+as400_engine_kkins = call_session_engine(source_system='as400_kkins')
+as400_engine_attorney = call_session_engine(source_system='as400_attorney')
+
+# ------------------------------------------------------------
+# AS400 Lookup Function
+# ------------------------------------------------------------
+def lookup_as400(config=None, id=None):
+    """
+    Fetch a coverage carrier allocation record from AS400 based on allocation ID.
+    Adjust table/column names based on your AS400 schema.
+    """
+    source_system = config['source_system']
+    if source_system:
+        if(source_system.lower() == 'as400_affprd'):
+                df = pd.read_sql(f"""
+                SELECT 
+                --CAST(NULL AS varchar(255)) AS df_transaction_coverage_id
+                --,CAST(NULL AS varchar(255)) AS coverage_id
+                --,CAST(NULL AS varchar(255)) AS df_transaction_id
+                cv.CUSTOMER_NO||'_'||cv.ACCOUNT_NO AS source_transaction_id
+                ,cv.LIMIT_CODE AS coverage_code
+                ,tp.AGGREGATE_AMOUNT AS limits
+                ,CAST(NULL AS varchar(255)) AS deductable
+                ,tp.LIMIT_AMOUNT AS per_occurance
+                ,cv.TOTAL_PREMIUM AS premium
+                ,CAST(NULL AS varchar(255)) AS created_date
+                FROM ADGDTAPR.NSOCVGP cv
+                INNER JOIN 
+                ADGDTAPR.HCPLMTP tp ON  tp.LIMIT_CODE = cv.LIMIT_CODE
+                WHERE cv.CUSTOMER_NO||'_'||cv.ACCOUNT_NO = '{id}'
+                    """, con=as400_engine_aff)
+
+        elif(source_system.lower() == 'as400_attorney'):
+                df = pd.read_sql(f"""
+                SELECT 
+                --df_transaction_coverage_id
+                --coverage_id
+                --df_transaction_id
+                CVPOLN AS source_policy_id
+                ,CVALMT AS limits
+                ,CVDED AS deductable
+                ,CVPLMT AS per_occurance
+                ,CVPRMT AS premium
+                --created_date
+                --modified_date
+                FROM LAWDTAPR.ATACV1P
+                WHERE CVPOLN = '{id}'
+                    """, con=as400_engine_attorney)
+
+        elif(source_system.lower() == 'as400_kkins'):
+                df = pd.read_sql(f"""
+                SELECT 
+                DISTINCT tc.CV_COVERAGE_CODE AS coverage_code
+                -- ,tc.PL_COV_NBR AS coverage_id
+                ,p.PL_PRODUCT_CODE||'-'||tc.PL_COMPANY||'-'||tc.PL_PREFIX||'-'||tc.PL_POL_NBR||'-'||tc.PL_SUFFIX||'-'||tc.PL_SEQ_NBR AS source_transaction_id
+                ,tc.PL_COMPANY||tc.PL_PREFIX||tc.PL_POL_NBR||tc.PL_SUFFIX AS policy_number
+                ,tc.CV_LIMIT_2 AS limits
+                ,tc.CV_DED AS deductable
+                ,tc.CV_LIMIT_1 AS per_occurance
+                ,tc.CV_PREMIUM AS premium
+                --created_date
+                --modified_date
+                FROM PLCYPROD.AUZ003B p
+                INNER JOIN
+                PLCYPROD.AUZ015 tc ON p.PL_COMPANY =tc.PL_COMPANY  AND p.PL_PREFIX =tc.PL_PREFIX AND p.PL_POL_NBR =tc.PL_POL_NBR 
+                AND p.PL_SUFFIX = tc.PL_SUFFIX
+                WHERE tc.PL_COMPANY||tc.PL_PREFIX||tc.PL_POL_NBR||tc.PL_SUFFIX = '{id}'
+                    """, con=as400_engine_kkins)
+    else:
+        df=None
+
+    if(len(df)>0):
+        return df.to_dict('records')[0]
+    else:
+        return None
+
+# ------------------------------------------------------------
+# Main Consumer Function
+# ------------------------------------------------------------
+async def consume_lambda(config=None):
+    now = datetime.now()
+    start_timestamp = datetime.timestamp(now)
+    asyncio.create_task(log_msg(logger, log_messages=f'Processing AS400 Transaction Coverage @ {now}'))
+
+    try:
+        config_dicts = config if isinstance(config, list) else [json.loads(config)] if isinstance(config, str) else [config]
+
+        for conf in config_dicts:
+            cov_id = conf.get("source_transaction_coverage_id")
+            source_system = conf.get("source_system", "as400_aff").lower()
+
+            asyncio.create_task(log_msg(logger, log_messages=f'Invoking handler for {source_system} transaction coverage {cov_id}'))
+
+            if not cov_id:
+                continue
+
+            # --- Fetch record from AS400 ---
+            as400_data = lookup_as400(config=conf, id=cov_id)
+            if not as400_data:
+                asyncio.create_task(log_msg(logger, log_messages=f'No AS400 record found for {cov_id}'))
+                continue
+
+            asyncio.create_task(log_msg(logger, log_messages='AS400 Transaction Coverage Data Fetched', api_response=convert_timestamps(as400_data)))
+
+            # --- FK lookups ---
+            # Transaction lookup
+            txn_rec = multi_filter_get_record(
+                session, model=Transaction,
+                source_transaction_id=as400_data.get("source_transaction_id")
+            ).first()
+            if txn_rec:
+                as400_data['df_transaction_id'] = txn_rec.df_transaction_id
+            else:
+                asyncio.create_task(log_msg(logger, log_messages=f'Transaction not found for Transaction_Coverage {cov_id}'))
+
+            # Coverage lookup
+            coverage_rec = multi_filter_get_record(
+                session, model=Coverage,
+                source_coverage_id=as400_data.get("source_coverage_id")
+            ).first()
+            if coverage_rec:
+                as400_data['coverage_id'] = coverage_rec.coverage_id
+            else:
+                asyncio.create_task(log_msg(logger, log_messages=f'Inserted Coverage {as400_data["source_coverage_id"]}'))
+
+            # --- Insert or Update Transaction Coverage ---
+            existing_cov = multi_filter_get_record(
+                session, model=Transaction_Coverage,
+                source_transaction_coverage_id=as400_data.get("source_transaction_coverage_id")
+            ).first()
+
+            if not existing_cov:
+                df_transaction_coverage_id = generate_uuid(
+                    str(as400_data.get("source_transaction_coverage_id")), "txn_cov"
+                )
+
+                as400_data["df_transaction_coverage_id"] = df_transaction_coverage_id
+                existing_uuid = session.query(Transaction_Coverage).filter(
+                    Transaction_Coverage.df_transaction_coverage_id == df_transaction_coverage_id
+                ).first()
+
+                if not existing_uuid:
+                    session.add(Transaction_Coverage.from_dict(cls=Transaction_Coverage, d=as400_data))
+                    asyncio.create_task(log_msg(logger, log_messages=f'Inserted Transaction_Coverage {cov_id}'))
+                else:
+                    logger.info(f"ransaction Coverage already exist with df_transaction_coverage_id {existing_uuid.df_transaction_coverage_id}")
+            else:
+                as400_data["df_transaction_coverage_id"] = existing_cov.df_transaction_coverage_id
+                session.query(Transaction_Coverage).filter(
+                    Transaction_Coverage.df_transaction_coverage_id == existing_cov.df_transaction_coverage_id
+                ).update(query_update_dict(obj=Transaction_Coverage, dict=as400_data))
+                asyncio.create_task(log_msg(logger, log_messages=f'Updated Transaction_Coverage {cov_id}'))
+
+            session.commit()
+
+        end_timestamp = datetime.timestamp(datetime.now())
+        return {'execution_time_sec': end_timestamp - start_timestamp}
+
+    except SQLAlchemyError as e:
+        session.rollback()
+        asyncio.create_task(log_msg(logger, log_messages='DB Error', api_response=str(e)))
+        raise e
+
+# ------------------------------------------------------------
+# Lambda Handler
+# ------------------------------------------------------------
+
+def handle(event, context):
+    start_time = time.time()
+    for record in event['Records']:
+        logger.info(record)
+        payload = record["body"]
+        asyncio.run(consume_lambda(config=payload))
+    end_time = time.time()
+    return {"execution_time_sec": end_time - start_time}
+
+# Example Local Run
+# if __name__ == "__main__":
+#     handle({'Records': [{'body': '{"source_transaction_coverage_id":"200001","source_system":"AS400_AFF"}'}]}, None)
