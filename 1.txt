@@ -1,0 +1,736 @@
+import os
+import logging
+import json
+import time
+import requests
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import func, and_,select, BIGINT, create_engine, Column, update, Integer, cast, String, MetaData, DateTime, Float, Text, DECIMAL, TIMESTAMP, text
+from sqlalchemy.orm import Session, declarative_base
+from df_database_models.db_conn import get_rds_db_session, get_aumine_db_session, get_as400_db_session
+from df_database_models.db_conn import *
+from df_database_models.models import Agency, Customer, Agency_Contact, Customer_Contact, Policy, Source_System, Policy_Status, Transaction, Transaction_Type, Policy_Number_Version
+from df_database_models.db_utils import  generate_uuid, convert_timestamps, query_update_dict, policy_version_increment, latest_policy_version, latest_transaction_id, get_record, multi_filter_get_record, push_msg_to_sqs, call_sp
+from df_database_models.db_utils import *
+from df_database_models.db_lookup import generic_product_lookup
+from secrets_manager import get_secret
+from datetime import datetime
+import pandas as pd
+import asyncio
+from adf_pyutils.clm_wrapper import common_logger, generate_response_log_details
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+pnc_db = os.environ['RDS_DB_NAME']
+ref_db = os.environ['RDS_REF_DB_NAME']
+mdm_raw_db = os.environ['RDS_RAW_DB_NAME']
+mdm_refined_db = os.environ['RDS_REFINED_DB_NAME']
+
+## Fetch SQS producer Parameters from aws secret manager
+
+async def log_msg(func,**kwargs):
+    await asyncio.to_thread(func,**kwargs)
+
+def call_session_engine(source_system=None, database_name=None):
+
+    rds_secret_name  = os.environ["RDS_SECRETS_MANAGER_ID"]
+    region_name = os.environ["AWS_REGION"]
+    rds_host_nm = os.environ['RDS_HOST']
+
+    if database_name == 'ref_data':
+        rds_db_nm = os.environ['RDS_REF_DB_NAME']
+    elif database_name == 'mdm_raw':
+        rds_db_nm = os.environ['RDS_RAW_DB_NAME']
+    elif database_name == 'mdm_refined':
+        rds_db_nm = os.environ['RDS_REFINED_DB_NAME']
+    else:
+        rds_db_nm = os.environ['RDS_DB_NAME']
+
+    if source_system and source_system.lower() == 'as400_aff':
+        as400_secret_name = os.environ["AS400_AFF_SECRETS_MANAGER_ID"]
+        as400_engine= get_as400_db_session(as400_secret_name, region_name)
+        return as400_engine
+
+    if database_name:
+        session = get_rds_db_session(rds_secret_name, region_name, rds_host_nm, rds_db_nm)
+        return session
+
+# --- Global Sessions ---
+session = call_session_engine(database_name=pnc_db)
+as400_engine_aff = call_session_engine(source_system='as400_aff')
+as400_engine_kkins = call_session_engine(source_system='as400_kkins')
+
+def lookup_as400_policy(config=None, id=None):
+    source_system = config['source_system']
+    if source_system:
+        if source_system.lower() == 'as400_aff':
+            df = pd.read_sql(f"""
+                SELECT * FROM (s
+                    SELECT
+                        ROW_NUMBER() OVER (
+                            PARTITION BY a.ACCOUNT_NO
+                            ORDER BY c.ENDORSEMENT_SEQ_NO DESC
+                        ) AS row_num,
+                        a.ACCOUNT_NO AS policy_number,
+                        c.ENDORSEMENT_NO AS endorsement_number,
+                        c.ENDORSEMENT_SEQ_NO AS endorsement_sequence_number,
+                        CASE
+                            WHEN a.ENTITY_STATUS = 'A' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'T' THEN 'Terminated'
+                            WHEN a.ENTITY_STATUS = 'R' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'P' THEN 'Pending'
+                            WHEN a.ENTITY_STATUS = 'Q' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'Z' THEN 'Terminated'
+                        END AS source_policy_status,
+                        CASE
+                            WHEN a.ENTITY_STATUS = 'A' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'T' THEN 'Terminated'
+                            WHEN a.ENTITY_STATUS = 'R' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'P' THEN 'Pending'
+                            WHEN a.ENTITY_STATUS = 'Q' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'Z' THEN 'Terminated'
+                        END AS policy_status,
+                        CASE
+                            WHEN (a.PROFESSION_FLAG IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE = 'I') THEN '71a7b727-0787-4935-a0d0-0704dbcdd711'
+                            WHEN (a.PROFESSION_FLAG IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE != 'I') THEN 'e71ba4fc-afa1-4396-a8ef-c7a22765adb8'
+                            WHEN (a.PROFESSION_FLAG NOT IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE != 'I') THEN '2bd40533-6f37-4239-bfbf-8f22feddbb2e'
+                            WHEN (a.PROFESSION_FLAG NOT IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE = 'I') THEN 'f84e4b29-8069-45b5-8e46-835cf590a569'
+                            WHEN a.POLICY_TYPE = 'U' THEN '5b0f4296-767c-4196-bd10-d13d2fc68ad8'
+                        END AS product_id,
+                        LTRIM(RTRIM(a.SUBPROD_NO)) AS source_agency_id,
+                        a.CUSTOMER_NO AS source_customer_id,
+                        a.POLICY_EFF_DATE AS effective_date,
+                        a.POLICY_EXP_DATE AS expiration_date,
+                        b.POLICY_ISSUE_DATE AS policy_issue_date,
+                        'AS400_AFFPRD' AS source_system
+                    FROM [ADGDTADV].[NSOCVGP] a
+                    INNER JOIN [ADGDTADV].[ADGACIP] b ON a.CUSTOMER_NO = b.CUSTOMER_NO
+                    INNER JOIN [ADGDTADV].[HCPCVEP] c 
+                        ON a.CUSTOMER_NO = c.CUSTOMER_NO 
+                        AND a.POLICY_EFF_DATE = c.EFFECTIVE_DATE
+                        AND a.POLICY_EXP_DATE = c.TERMIN_DATE
+                    WHERE a.POLICY_EFF_DATE <= CONVERT(char(8), GETDATE(), 112)
+                    AND a.POLICY_EXP_DATE > CONVERT(char(8), GETDATE(), 112)
+                    AND a.ENTITY_STATUS = 'A'
+                ) ab
+                WHERE row_num = 1 AND {"source_customer_id" if "source_customer_id" in config else "policy_number"} = {id}
+            """, con=as400_engine_aff)
+
+        elif source_system.lower() == 'as400_kkins':
+            df = pd.read_sql(f"""
+                SELECT * FROM (
+                    SELECT
+                        ROW_NUMBER() OVER (
+                            PARTITION BY a.ACCOUNT_NO
+                            ORDER BY c.ENDORSEMENT_SEQ_NO DESC
+                        ) AS row_num,
+                        a.ACCOUNT_NO AS policy_number,
+                        c.ENDORSEMENT_NO AS endorsement_number,
+                        c.ENDORSEMENT_SEQ_NO AS endorsement_sequence_number,
+                        CASE
+                            WHEN a.ENTITY_STATUS = 'A' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'T' THEN 'Terminated'
+                            WHEN a.ENTITY_STATUS = 'R' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'P' THEN 'Pending'
+                            WHEN a.ENTITY_STATUS = 'Q' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'Z' THEN 'Terminated'
+                        END AS source_policy_status,
+                        CASE
+                            WHEN a.ENTITY_STATUS = 'A' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'T' THEN 'Terminated'
+                            WHEN a.ENTITY_STATUS = 'R' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'P' THEN 'Pending'
+                            WHEN a.ENTITY_STATUS = 'Q' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'Z' THEN 'Terminated'
+                        END AS policy_status,
+                        CASE
+                            WHEN (a.PROFESSION_FLAG IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE = 'I') THEN '71a7b727-0787-4935-a0d0-0704dbcdd711'
+                            WHEN (a.PROFESSION_FLAG IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE != 'I') THEN 'e71ba4fc-afa1-4396-a8ef-c7a22765adb8'
+                            WHEN (a.PROFESSION_FLAG NOT IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE != 'I') THEN '2bd40533-6f37-4239-bfbf-8f22feddbb2e'
+                            WHEN (a.PROFESSION_FLAG NOT IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE = 'I') THEN 'f84e4b29-8069-45b5-8e46-835cf590a569'
+                            WHEN a.POLICY_TYPE = 'U' THEN '5b0f4296-767c-4196-bd10-d13d2fc68ad8'
+                        END AS product_id,
+                        LTRIM(RTRIM(a.SUBPROD_NO)) AS source_agency_id,
+                        a.CUSTOMER_NO AS source_customer_id,
+                        a.POLICY_EFF_DATE AS effective_date,
+                        a.POLICY_EXP_DATE AS expiration_date,
+                        b.POLICY_ISSUE_DATE AS policy_issue_date,
+                        'AS400_AFFPRD' AS source_system
+                    FROM [ADGDTADV].[NSOCVGP] a
+                    INNER JOIN [ADGDTADV].[ADGACIP] b ON a.CUSTOMER_NO = b.CUSTOMER_NO
+                    INNER JOIN [ADGDTADV].[HCPCVEP] c 
+                        ON a.CUSTOMER_NO = c.CUSTOMER_NO 
+                        AND a.POLICY_EFF_DATE = c.EFFECTIVE_DATE
+                        AND a.POLICY_EXP_DATE = c.TERMIN_DATE
+                    WHERE a.POLICY_EFF_DATE <= CONVERT(char(8), GETDATE(), 112)
+                    AND a.POLICY_EXP_DATE > CONVERT(char(8), GETDATE(), 112)
+                    AND a.ENTITY_STATUS = 'A'
+                ) ab
+                WHERE row_num = 1 AND {"source_customer_id" if "source_customer_id" in config else "policy_number"} = {id}
+            """, con=as400_engine_aff)
+
+    else:
+        df=None     
+        
+    if(len(df)>0):
+        return df.to_dict('records')[0]
+    else:
+        return None
+
+async def consume_lambda(config=None):
+    now = datetime.now()
+    start_timestamp = datetime.timestamp(now)
+    asyncio.create_task(log_msg(logger, log_messages=f'Processing AS400 Policy @ {now}'))
+
+    try:
+        # config_dicts = config if isinstance(config, list) else [json.loads(config)] if isinstance(config, str) else [config]
+        if isinstance(config, str):
+            loaded = json.loads(config)
+            config_dicts = loaded if isinstance(loaded, list) else [loaded]
+        elif isinstance(config, list):
+            config_dicts = config
+        else:
+            config_dicts = [config]
+
+        for config_dict in config_dicts:
+            # id = config_dict.get("source_policy_id") if "source_policy_id" in config_dict else config_dict.get("source_customer_id")
+            source_system = config_dict.get("source_system").lower()
+
+            if "source_policy_id" in config_dict and config_dict.get("source_policy_id") is not None:
+                id = int(config_dict.get("source_policy_id"))
+            elif "source_customer_id" in config_dict and config_dict.get("source_customer_id") is not None:
+                id = config_dict.get("source_customer_id")
+
+            asyncio.create_task(log_msg(logger, log_messages=f'Invoking handler for {source_system} policy {id}'))
+            if not id:
+                continue
+
+            # global as400_engine
+            # as400_engine = as400_engine_aff if source_system == 'as400_aff' else as400_engine_kkins
+
+            as400_policy_dict = lookup_as400_policy(config=config_dict, id=id)
+            if not as400_policy_dict:
+                asyncio.create_task(log_msg(logger, log_messages=f'No AS400 policy record found for {id}'))
+                continue
+
+            asyncio.create_task(log_msg(logger, log_messages=f'AS400 Policy Data Fetched', api_response=convert_timestamps(as400_policy_dict)))
+
+            # --- FK Lookups ---
+            if "source_system" in as400_policy_dict:
+                src_sys_rec = get_record(session, model=Source_System, column_name="source_system", value=as400_policy_dict.get("source_system", None)).first()
+                if src_sys_rec:
+                    as400_policy_dict["df_source_system_id"] = src_sys_rec.df_source_system_id
+
+            if "policy_status" in as400_policy_dict:
+                policy_status_rec = get_record(session, model=Policy_Status, column_name="policy_status", value=as400_policy_dict.get("policy_status", None)).first()
+                if policy_status_rec:
+                    as400_policy_dict["df_policy_status_id"] = policy_status_rec.df_policy_status_id
+
+            if "transaction_type" in as400_policy_dict:
+                txn_type_rec = get_record(session, model=Transaction_Type, column_name="transaction_type", value=as400_policy_dict.get("transaction_type", None)).first()
+                if txn_type_rec:
+                    as400_policy_dict["df_transaction_type_id"] = txn_type_rec.df_transaction_type_id
+
+            # --- Agency/Customer Entities ---
+            src_agency_id = as400_policy_dict.get("source_agency_id")
+            src_customer_id = as400_policy_dict.get("source_customer_id")
+            df_source_system_id = as400_policy_dict.get("df_source_system_id")
+
+            agency_record = (query.first() if (query := multi_filter_get_record(session, model=Agency, source_agency_id=src_agency_id, df_source_system_id=df_source_system_id)) else None)
+            customer_record = (query.first() if (query := multi_filter_get_record(session, model=Customer, source_customer_id=src_customer_id, df_source_system_id=df_source_system_id)) else None)
+
+            if agency_record:
+                as400_policy_dict['df_agency_id'] = agency_record.df_agency_id
+            else:
+                as400_policy_dict['df_agency_id'] = generate_uuid(str(src_agency_id or ''), str(df_source_system_id))
+                session.add(Agency.from_dict(cls=Agency, d=as400_policy_dict))
+                session.commit()
+
+            if customer_record:
+                as400_policy_dict['df_customer_id'] = customer_record.df_customer_id
+            else:
+                df_customer_id = generate_uuid(str(src_customer_id or ''), str(df_source_system_id))
+                as400_policy_dict['df_customer_id'] = df_customer_id
+
+                # Double check if this UUID already exist in DB
+                existing_uuid = session.query(Customer).filter(
+                    Customer.df_customer_id == df_customer_id
+                ).first()
+                if not existing_uuid:
+                    session.add(Customer.from_dict(cls=Customer, d=as400_policy_dict))
+                    session.commit()
+                    asyncio.create_task(log_msg(logger, log_messages=f'Inserted customer {src_customer_id}'))
+                else:
+                    logger.info(f"Customer already exist with df_customer_id {existing_uuid.df_customer_id}")
+                    
+            # --- Policy Upsert ---
+            policy_record = multi_filter_get_record(session, model=Policy,
+                                                    policy_number=as400_policy_dict["policy_number"],
+                                                    df_source_system_id=df_source_system_id)
+            existing_policy = policy_record.first() if policy_record else None
+
+            if not existing_policy:
+                df_policy_id = generate_uuid(str(as400_policy_dict["policy_number"]), str(df_source_system_id))
+                as400_policy_dict["df_policy_id"] = df_policy_id
+
+                # Double check if this UUID already exist in DB
+                existing_uuid_policy = session.query(Policy).filter(
+                    Policy.df_policy_id == df_policy_id
+                ).first()
+                if not existing_uuid_policy:
+                    session.add(Policy.from_dict(cls=Policy, d=as400_policy_dict))
+                    session.commit()
+                    asyncio.create_task(log_msg(logger, log_messages=f'Inserted Policy {id}'))
+                else:
+                    logger.info(f"Policy already exist with df_customer_id {existing_uuid_policy.df_policy_id}")
+
+            else:
+                as400_policy_dict["df_policy_id"] = existing_policy.df_policy_id
+                policy_record.update(query_update_dict(obj=Policy, dict=as400_policy_dict))
+                asyncio.create_task(log_msg(logger, log_messages=f'Updated Policy {id}'))
+
+            # --- Policy Version ---
+            df_policy_id = as400_policy_dict['df_policy_id']
+            policy_version = multi_filter_get_record(session, model=Policy_Number_Version,
+                                                     policy_number=as400_policy_dict["policy_number"])
+            existing_version = policy_version.first() if policy_version else None
+
+            if not existing_version:
+                version_number = policy_version_increment(None)
+                df_policy_number_version_id = generate_uuid(
+                    str(as400_policy_dict["policy_number"]) + str(df_policy_id),
+                    str(df_source_system_id)
+                )
+                as400_policy_dict['df_policy_number_version_id'] = df_policy_number_version_id
+                as400_policy_dict['policy_version_number'] = version_number
+                as400_policy_dict['policy_effective_date'] = as400_policy_dict['effective_date']
+                as400_policy_dict['policy_expiration_date'] = as400_policy_dict['expiration_date']
+                as400_policy_dict['is_latest'] = 1
+
+                existing_uuid_policy_version = session.query(Policy_Number_Version).filter(
+                    Policy_Number_Version.df_policy_id == df_policy_id
+                ).first()
+
+                if not existing_uuid_policy_version:
+                    session.add(Policy_Number_Version.from_dict(cls=Policy_Number_Version, d=as400_policy_dict))
+                    session.commit()
+                    asyncio.create_task(log_msg(logger, log_messages=f'Inserted Policy Version {id}'))
+
+                else:
+                    logger.info(f"Policy version already exist with df_policy_id {existing_uuid_policy_version.df_policy_id}")
+
+            else:
+                policy_version.update(query_update_dict(obj=Policy_Number_Version, dict=as400_policy_dict))
+                asyncio.create_task(log_msg(logger, log_messages=f'Updated Policy Version {id}'))
+
+        end_timestamp = datetime.timestamp(datetime.now())
+        return {'execution_time_sec': end_timestamp - start_timestamp}
+
+    except SQLAlchemyError as e:
+        session.rollback()
+        asyncio.create_task(log_msg(logger, log_messages='DB Error', api_response=str(e)))
+        raise e
+
+def handle(event, context):
+    start_time = time.time()
+    for record in event['Records']:
+        logger.info(record)
+        payload = record["body"]
+        asyncio.run(consume_lambda(config=payload))
+
+    end_time = time.time()
+
+    return {
+        "execution_time_sec": end_time - start_time 
+    }
+
+
+# if __name__ == '__main__':
+    # handle({'Records': [{'body': '{"source_policy_id":"1003093977","event_type":"INSERT/DELETE"}'}]}, None)
+    # handle({'Records': [{'body': '{"source_system": "as400_aff", "source_policy_id": "472518101"}', 'attributes': {'ApproximateReceiveCount': '1', 'AWSTraceHeader': 'Root=1-691d8740-81715fffe43f2a204959953c;Parent=71ad32606c66fe4e;Sampled=0;Lineage=1:f3991287:0', 'SentTimestamp': '1763542848965', 'SenderId': 'AROA6DGB54JXCWIRH5J4R:affinity-tds-ar4262-dv001-df-das-sqs-processor', 'ApproximateFirstReceiveTimestamp': '1763542848966'}, 'messageAttributes': {}, 'md5OfBody': 'ef368302702448d70759ca45b754f1fe', 'eventSource': 'aws:sqs', 'eventSourceARN': 'arn:aws:sqs:us-east-1:968921834094:affinity-tds-ar4262-dv001-df-sqs-as400-aff-kkins-policy', 'awsRegion': 'us-east-1'}]}, None)
+    # handle({'Records': [{'body': '[{"source_system": "as400_aff", "source_policy_id":"429563236"}]'}]}, None)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import os
+import logging
+import json
+import time
+import pandas as pd
+import asyncio
+from datetime import datetime
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import and_
+
+# --- DF imports ---
+from df_database_models.db_conn import get_rds_db_session, get_as400_db_session
+from df_database_models.models import (
+    Policy,
+    Policy_Number_Version
+)
+from df_database_models.db_utils import (
+    generate_uuid,
+    convert_timestamps,
+    query_update_dict,
+    multi_filter_get_record,
+    policy_version_increment
+)
+from adf_pyutils.clm_wrapper import common_logger, generate_response_log_details
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+
+os.environ["AWS_REGION"] = "us-east-1"
+
+os.environ['RDS_DB_NAME'] = "pnc_warehouse"
+os.environ['RDS_REF_DB_NAME'] = "ref_data"
+os.environ['RDS_RAW_DB_NAME'] = "mdm_raw"
+os.environ['RDS_REFINED_DB_NAME'] = "mdm_refined"
+
+os.environ['AS400_AFF_SECRETS_MANAGER_ID'] = "arn:aws:secretsmanager:us-east-1:968921834094:secret:affinity-tds-ar4262-dv001-azsql-affpmsqc-credentials-secret-XJspXZ"
+os.environ['AS400_KKINS_SECRETS_MANAGER_ID'] = "arn:aws:secretsmanager:us-east-1:968921834094:secret:affinity-tds-ar4262-dv001-azsql-kkinsqc-credentials-secret-KThAVI"
+os.environ['AUMINE_AFF_SECRETS_MANAGER_ID'] = "arn:aws:secretsmanager:us-east-1:968921834094:secret:affinity-tds-ar4262-dv001-audbm-affods-credentials-secret-vclZk7"
+os.environ['AUMINE_AUM_SECRETS_MANAGER_ID'] = "arn:aws:secretsmanager:us-east-1:968921834094:secret:affinity-tds-ar4262-dv001-audbm-aumods-credentials-secret-tOkXG3"
+
+os.environ['RDS_HOST'] = "affinity-ods2-develop.cluster-cj3qp6qspcpk.us-east-1.rds.amazonaws.com"
+os.environ['RDS_SECRETS_MANAGER_ID'] = "arn:aws:secretsmanager:us-east-1:968921834094:secret:affinity-ods2-ar4262-dv001-rds-master-credentials-169S6S"
+os.environ['SQS_POLICY_UPDATE_URL'] = "https://6ekyb6mh5sxa3wpf3waq7ckvy40gckvy.lambda-url.us-east-1.on.aws/policy-update"
+os.environ['SQS_PRODUCER_SECRET_ID'] = "arn:aws:secretsmanager:us-east-1:968921834094:secret:affinity-tds-ar4262-dv001-tds-sqs-producer-v2-credentials-Cna5zK"
+
+# --- Global DB config ---
+pnc_db = os.environ['RDS_DB_NAME']
+ref_db = os.environ['RDS_REF_DB_NAME']
+mdm_raw_db = os.environ['RDS_RAW_DB_NAME']
+mdm_refined_db = os.environ['RDS_REFINED_DB_NAME']
+
+# ------------------------------------------------------------
+# Logging helper
+# ------------------------------------------------------------
+async def log_msg(func, **kwargs):
+    await asyncio.to_thread(func, **kwargs)
+
+# ------------------------------------------------------------
+# Session creation
+# ------------------------------------------------------------
+def call_session_engine(source_system=None, database_name=None):
+    rds_secret_name = os.environ["RDS_SECRETS_MANAGER_ID"]
+    region_name = os.environ["AWS_REGION"]
+    rds_host_nm = os.environ['RDS_HOST']
+
+    if database_name:
+        if database_name == 'ref_data':
+            rds_db_nm = os.environ['RDS_REF_DB_NAME']
+        elif database_name == 'mdm_raw':
+            rds_db_nm = os.environ['RDS_RAW_DB_NAME']
+        elif database_name == 'mdm_refined':
+            rds_db_nm = os.environ['RDS_REFINED_DB_NAME']
+        else:
+            rds_db_nm = os.environ['RDS_DB_NAME']
+    else:
+        rds_db_nm = os.environ['RDS_DB_NAME']
+
+    if source_system and source_system.lower() == 'as400_aff':
+        as400_secret_name = os.environ["AS400_AFF_SECRETS_MANAGER_ID"]
+        return get_as400_db_session(as400_secret_name, region_name)
+
+    elif source_system and source_system.lower() == 'as400_kkins':
+        as400_secret_name = os.environ["AS400_KKINS_SECRETS_MANAGER_ID"]
+        return get_as400_db_session(as400_secret_name, region_name)
+
+    return get_rds_db_session(rds_secret_name, region_name, rds_host_nm, rds_db_nm)
+
+
+# --- Global Sessions ---
+session = call_session_engine(database_name=pnc_db)
+as400_engine_aff = call_session_engine(source_system='as400_aff')
+as400_engine_kkins = call_session_engine(source_system='as400_kkins')
+
+# ------------------------------------------------------------
+# AS400 Lookup Function
+# ------------------------------------------------------------
+def lookup_as400(config=None, id=None):
+    """
+    Fetch a coverage carrier allocation record from AS400 based on allocation ID.
+    Adjust table/column names based on your AS400 schema.
+    """
+    source_system = config['source_system']
+    print(source_system, '***')
+    if(source_system and source_system.lower() == 'as400_aff'):
+            df = pd.read_sql(f"""
+                WITH combined AS (
+                SELECT 
+                    a.ACCOUNT_NO AS policy_number,
+                    a.CUSTOMER_NO AS customer_number,
+                    a.NEW_OR_RENEW AS transaction_type,
+                    a.POLICY_EFF_DATE AS policy_effective_date,
+                    a.POLICY_EXP_DATE AS policy_expiration_date,
+                    a.LAST_CHANGE_DATE AS transaction_date,
+                    a.ENTITY_STATUS AS policy_status
+                FROM ADGDTADV.NSOCVHP a
+                UNION ALL
+                SELECT 
+                    a.ACCOUNT_NO AS policy_number,
+                    a.CUSTOMER_NO AS customer_number,
+                    a.NEW_OR_RENEW AS transaction_type,
+                    a.POLICY_EFF_DATE AS policy_effective_date,
+                    a.POLICY_EXP_DATE AS policy_expiration_date,
+                    a.LAST_CHANGE_DATE AS transaction_date,
+                    a.ENTITY_STATUS AS policy_status
+                FROM ADGDTADV.NSOCVGP a
+                WHERE a.ENTITY_STATUS NOT IN ('Q','Z')
+            )
+            SELECT 
+                policy_number,
+                customer_number,
+                transaction_type,
+                policy_effective_date,
+                policy_expiration_date,
+                transaction_date,
+                policy_status,
+                'V' + CAST(ROW_NUMBER() OVER (
+                    PARTITION BY customer_number
+                    ORDER BY policy_effective_date, policy_expiration_date
+                ) AS varchar(10)) AS policy_number_version,
+                LAG(policy_number) OVER (
+                    PARTITION BY customer_number
+                    ORDER BY policy_effective_date, policy_expiration_date
+                ) AS previous_policy_id
+            FROM combined 
+            WHERE policy_number  = '{id}'
+                """, con=as400_engine_aff)
+
+    elif(source_system and source_system.lower() == 'as400_kkins'):
+            df = pd.read_sql(f"""
+                    WITH policy_chain (policy_number, renewed_to, renewal_of, effective_date, expiration_date, endorsement, version_depth, customer, root_policy, policy_status, agency_id, agency_contact_id, policy_issue_date, product_code) AS (
+
+                    SELECT policy_number, renewed_to, renewal_of, effective_date, expiration_date, endorsement, 0 AS version_depth, customer, root_policy, policy_status, agency_id, agency_contact_id, policy_issue_date, product_code
+                    FROM (SELECT DISTINCT 
+                        (au.PL_COMPANY || au.PL_PREFIX || au.PL_POL_NBR || PL_SUFFIX) AS policy_number,
+                        (au.PL_RENEWED_TO_CMP_NBR || au.PL_RENEWED_TO_PFX_NBR || au.PL_RENEWED_TO_POL_NBR || PL_RENEWED_TO_SUFFIX) AS renewed_to,
+                        (au.PL_RENEWAL_OF_CMP_NBR || au.PL_RENEWAL_OF_PFX_NBR || au.PL_RENEWAL_OF_POL_NBR || PL_RENEWAL_OF_SUFFIX) AS renewal_of,
+                        CASE WHEN substring(PL_EFF_DATE_YMD, 1, 1) = '1' THEN '20' || SUBSTRING(PL_EFF_DATE_YMD, 2, 6) 
+                            WHEN PL_EFF_DATE_YMD = '0' THEN NULL 
+                            ELSE '19' || SUBSTRING(PL_EFF_DATE_YMD, 1, 6) END AS effective_date,
+                        CASE WHEN substring(PL_EXP_DATE, 1, 1) = '1' THEN '20' || SUBSTRING(PL_EXP_DATE, 2, 6) 
+                            WHEN PL_EXP_DATE = '0' THEN NULL 
+                            ELSE '19' || SUBSTRING(PL_EXP_DATE, 1, 6) END AS expiration_date,
+                        au.PL_ENDT_NO AS endorsement,
+                        (au.AC_ACCOUNT_NBR || '-' || au.AC_ACCOUNT_NAME) AS customer,
+                        (au.PL_COMPANY || au.PL_PREFIX || au.PL_POL_NBR || PL_SUFFIX) AS root_policy,
+                        au.PL_POLICY_STATUS AS policy_status,
+                        au.AGY_AGENT_NBR AS agency_id,
+                        au.AGY_AGENT_CODE AS agency_contact_id,
+                        au.PL_ORIG_ISSUE AS policy_issue_date,
+                        au.PL_PRODUCT_CODE AS product_code
+                        FROM  PLCYPROD.AUZ003B AS au 
+                        WHERE --PL_POL_NBR IN ('00000187022', '00000188419', '00000185330', '00034502013', '00000318567', '00004424994', '00099890639', '00000181466') AND 
+                        (PL_RENEWAL_OF_POL_NBR = '' AND PL_ENDT_NO = '0')
+                        OR (PL_RENEWAL_OF_POL_NBR != '' AND PL_ENDT_NO = '0')) AS au
+                        WHERE renewal_of IS NULL OR TRIM(renewal_of) = ''
+                        
+                        
+                        
+                    UNION ALL
+                    
+                    SELECT au.policy_number, 
+                    au.renewed_to, 
+                    au.renewal_of, 
+                    au.effective_date,
+                    au.expiration_date, 
+                    au.endorsement,
+                    pc.version_depth + 1 AS version_depth,
+                    au.customer,
+                    pc.root_policy,
+                    au.PL_POLICY_STATUS AS policy_status,
+                    au.agency_id,
+                    au.agency_contact_id,
+                    au.policy_issue_date,
+                    au.product_code
+                    FROM (SELECT DISTINCT 
+                        (au.PL_COMPANY || au.PL_PREFIX || au.PL_POL_NBR || au.PL_SUFFIX) AS policy_number,
+                        (au.PL_RENEWED_TO_CMP_NBR || au.PL_RENEWED_TO_PFX_NBR || au.PL_RENEWED_TO_POL_NBR || PL_RENEWED_TO_SUFFIX) AS renewed_to,
+                        (au.PL_RENEWAL_OF_CMP_NBR || au.PL_RENEWAL_OF_PFX_NBR || au.PL_RENEWAL_OF_POL_NBR || PL_RENEWAL_OF_SUFFIX) AS renewal_of,
+                        CASE WHEN substring(PL_EFF_DATE_YMD, 1, 1) = '1' THEN '20' || SUBSTRING(PL_EFF_DATE_YMD, 2, 6) 
+                            WHEN PL_EFF_DATE_YMD = '0' THEN NULL 
+                            ELSE '19' || SUBSTRING(PL_EFF_DATE_YMD, 1, 6) END AS effective_date,
+                        CASE WHEN substring(PL_EXP_DATE, 1, 1) = '1' THEN '20' || SUBSTRING(PL_EXP_DATE, 2, 6) 
+                            WHEN PL_EXP_DATE = '0' THEN NULL 
+                            ELSE '19' || SUBSTRING(PL_EXP_DATE, 1, 6) END AS expiration_date,
+                        au.PL_ENDT_NO AS endorsement,
+                        (au.AC_ACCOUNT_NBR || '-' || au.AC_ACCOUNT_NAME) AS customer,
+                        au.PL_POLICY_STATUS,
+                        au.AGY_AGENT_NBR AS agency_id,
+                        au.AGY_AGENT_CODE AS agency_contact_id,
+                        au.PL_ORIG_ISSUE AS policy_issue_date,
+                        au.PL_PRODUCT_CODE AS product_code
+                        FROM PLCYPROD.AUZ003B AS au
+                        WHERE --PL_POL_NBR IN ('00000187022', '00000188419', '00000185330', '00034502013', '00000318567', '00004424994', '00099890639', '00000181466') AND 
+                        (PL_RENEWAL_OF_POL_NBR = '' AND PL_ENDT_NO = '0')
+                        OR (PL_RENEWAL_OF_POL_NBR != '' AND PL_ENDT_NO = '0')) AS au 
+                        JOIN policy_chain AS pc ON pc.policy_number = TRIM(au.renewal_of)
+
+                )
+
+
+                SELECT DISTINCT  
+                CAST(NULL AS varchar(36)) AS df_policy_number_version_id,
+                policy_number, 
+                CAST(NULL AS varchar(128)) AS df_policy_id,
+                'V' || CAST(version_depth AS varchar(5)) AS policy_version_number,
+                effective_date AS policy_effective_date,
+                expiration_date AS policy_expiration_date,
+                '0' AS is_surplus_lines,
+                CASE WHEN VERSION_DEPTH = MAX(VERSION_DEPTH) OVER(PARTITION BY ROOT_POLICY) THEN '1' ELSE '0' END AS is_latest,
+                CAST(NULL AS timestamp) AS created_date,
+                CAST(NULL AS timestamp) AS modified_date--,root_policy
+                --renewal_of,customer, root_policy--,policy_status, agency_id, agency_contact_id, policy_issue_date, product_code
+                FROM policy_chain AS p
+                WHERE --substring(policy_number, 8, 11) IN ('00000187022', '00000188419', '00000185330', '00034502013', '00000318567', '00004424994', '00099890639', '00000181466') AND 
+                policy_status NOT IN ('S', 'Q') 
+                AND policy_number = '{id}'
+                ORDER BY POLICY_VERSION_NUMBER --policy_number, effective_date, expiration_date
+
+                """, con=as400_engine_kkins)
+    else:
+        df=None
+
+    if(len(df)>0):
+        return df.to_dict('records')[0]
+    else:
+        return None
+
+
+# ------------------------------------------------------------
+# Main Consumer Function
+# ------------------------------------------------------------
+async def consume_lambda(config=None):
+    now = datetime.now()
+    start_timestamp = datetime.timestamp(now)
+    asyncio.create_task(log_msg(logger, log_messages=f'Processing AS400 Policy Number Version @ {now}'))
+
+    try:
+        config_dicts = config if isinstance(config, list) else [json.loads(config)] if isinstance(config, str) else [config]
+
+        for conf in config_dicts:
+            policy_id = conf.get("source_policy_id")
+            source_system = conf.get("source_system").lower()
+
+            asyncio.create_task(log_msg(logger, log_messages=f'Invoking handler for {source_system} policy version {policy_id}'))
+
+            if not policy_id:
+                continue
+
+            # --- Step 1: Fetch AS400 data ---
+            as400_data = lookup_as400(config=conf, id=policy_id)
+            print('*********************************************************')
+            print(as400_data)
+            print('*********************************************************')
+            if not as400_data:
+                asyncio.create_task(log_msg(logger, log_messages=f'No AS400 record found for Policy {policy_id}'))
+                continue
+
+            asyncio.create_task(log_msg(logger, log_messages='AS400 Policy Version Data Fetched', api_response=convert_timestamps(as400_data)))
+
+            # --- Step 2: FK Lookup → Policy ---
+            policy_rec = multi_filter_get_record(
+                session, model=Policy,
+                policy_number=as400_data.get("policy_number")
+            ).first()
+
+            if not policy_rec:
+                asyncio.create_task(log_msg(logger, log_messages=f'Policy not found for Policy Version {policy_id}'))
+                continue
+
+            as400_data["df_policy_id"] = policy_rec.df_policy_id
+
+            # --- Step 3: Determine if version already exists ---
+            existing_version = multi_filter_get_record(
+                session, model=Policy_Number_Version,
+                policy_number=as400_data.get("policy_number")
+            ).first()
+
+            if not existing_version:
+                version_number = policy_version_increment(None)
+                df_policy_number_version_id = generate_uuid(
+                    str(as400_data["policy_number"]) + str(policy_rec.df_policy_id),
+                    "policy_version"
+                )
+                as400_data["df_policy_number_version_id"] = df_policy_number_version_id
+                as400_data["policy_version_number"] = version_number
+                as400_data["is_latest"] = 1
+                as400_data["is_surplus_lines"] = as400_data.get("is_surplus_lines", 0)
+
+
+                existing_uuid = session.query(Policy_Number_Version).filter(
+                    Policy_Number_Version.df_policy_number_version_id == df_policy_number_version_id
+                ).first()
+                print('*********************************************************')
+                print(existing_uuid)
+                print('*********************************************************')
+                if not existing_uuid:
+                    session.add(Policy_Number_Version.from_dict(cls=Policy_Number_Version, d=as400_data))
+                    session.commit()
+                    asyncio.create_task(log_msg(logger, log_messages=f'Inserted Policy Version {policy_id}'))
+                else:
+                    print('*********************************************************')
+                    print('ELSE')
+                    print('*********************************************************')
+                    logger.info(f" Policy version number already exist with df_policy_number_version_id {existing_uuid.df_policy_number_version_id}")
+            else:
+                print('*********************************************************')
+                print('ELSE ELSE')
+                print('*********************************************************')
+                as400_data["is_surplus_lines"] = as400_data.get("is_surplus_lines", 0)
+                existing_version.update(query_update_dict(obj=Policy_Number_Version, dict=as400_data))
+                asyncio.create_task(log_msg(logger, log_messages=f'Updated Policy Version {policy_id}'))
+
+        end_timestamp = datetime.timestamp(datetime.now())
+        return {'execution_time_sec': end_timestamp - start_timestamp}
+
+    except SQLAlchemyError as e:
+        session.rollback()
+        asyncio.create_task(log_msg(logger, log_messages='DB Error', api_response=str(e)))
+        raise e
+
+# ------------------------------------------------------------
+# Lambda Handler
+# ------------------------------------------------------------
+def handle(event, context):
+    start_time = time.time()
+    for record in event['Records']:
+        logger.info(record)
+        payload = record["body"]
+        asyncio.run(consume_lambda(config=payload))
+    end_time = time.time()
+    return {"execution_time_sec": end_time - start_time}
+
+# Example local test:
+if __name__ == "__main__":
+    handle({'Records': [{'body': '{"source_system": "as400_aff", "source_policy_id": "430351651"}', 'attributes': {'ApproximateReceiveCount': '198', 'AWSTraceHeader': 'Root=1-691c38d6-e2ff0bf392ce5272e360ae3b;Parent=46f55d9636c26baa;Sampled=0;Lineage=1:f3991287:0', 'SentTimestamp': '1763457238616', 'SenderId': 'AROA6DGB54JXCWIRH5J4R:affinity-tds-ar4262-dv001-df-das-sqs-processor', 'ApproximateFirstReceiveTimestamp': '1763457240865'}, 'messageAttributes': {}, 'md5OfBody': 'de75ea4cff3826c61a43083619bd79d3', 'eventSource': 'aws:sqs', 'eventSourceARN': 'arn:aws:sqs:us-east-1:968921834094:affinity-tds-ar4262-dv001-df-sqs-as400-aff-kkins-pnv', 'awsRegion': 'us-east-1'}]}, None)
