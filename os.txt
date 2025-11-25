@@ -1,0 +1,309 @@
+import os
+import json
+import time
+import pandas as pd
+import asyncio
+from datetime import datetime
+from sqlalchemy.exc import SQLAlchemyError
+
+from df_database_models.db_conn import get_rds_db_session, get_as400_db_session
+from df_database_models.models import (
+    Customer_Contact, Customer, Source_System
+)
+from df_database_models.db_utils import (
+    generate_uuid, convert_timestamps, query_update_dict, get_record, multi_filter_get_record
+)
+from secrets_manager import get_secret
+from adf_pyutils.clm_wrapper import common_logger
+
+os.environ["AWS_REGION"] = "us-east-1"
+
+os.environ['RDS_DB_NAME'] = "pnc_warehouse"
+os.environ['RDS_REF_DB_NAME'] = "ref_data"
+os.environ['RDS_RAW_DB_NAME'] = "mdm_raw"
+os.environ['RDS_REFINED_DB_NAME'] = "mdm_refined"
+
+os.environ['AS400_AFF_SECRETS_MANAGER_ID'] = "arn:aws:secretsmanager:us-east-1:968921834094:secret:affinity-tds-ar4262-dv001-azsql-affpmsqc-credentials-secret-XJspXZ"
+os.environ['AS400_KKINS_SECRETS_MANAGER_ID'] = "arn:aws:secretsmanager:us-east-1:968921834094:secret:affinity-tds-ar4262-dv001-azsql-kkinsqc-credentials-secret-KThAVI"
+os.environ['AUMINE_AFF_SECRETS_MANAGER_ID'] = "arn:aws:secretsmanager:us-east-1:968921834094:secret:affinity-tds-ar4262-dv001-audbm-affods-credentials-secret-vclZk7"
+os.environ['AUMINE_AUM_SECRETS_MANAGER_ID'] = "arn:aws:secretsmanager:us-east-1:968921834094:secret:affinity-tds-ar4262-dv001-audbm-aumods-credentials-secret-tOkXG3"
+
+os.environ['RDS_HOST'] = "affinity-ods2-develop.cluster-cj3qp6qspcpk.us-east-1.rds.amazonaws.com"
+os.environ['RDS_SECRETS_MANAGER_ID'] = "arn:aws:secretsmanager:us-east-1:968921834094:secret:affinity-ods2-ar4262-dv001-rds-master-credentials-169S6S"
+os.environ['SQS_POLICY_UPDATE_URL'] = "https://6ekyb6mh5sxa3wpf3waq7ckvy40gckvy.lambda-url.us-east-1.on.aws/policy-update"
+os.environ['SQS_PRODUCER_SECRET_ID'] = "arn:aws:secretsmanager:us-east-1:968921834094:secret:affinity-tds-ar4262-dv001-tds-sqs-producer-v2-credentials-Cna5zK"
+
+pnc_db = os.environ['RDS_DB_NAME']
+ref_db = os.environ['RDS_REF_DB_NAME']
+mdm_raw_db = os.environ['RDS_RAW_DB_NAME']
+mdm_refined_db = os.environ['RDS_REFINED_DB_NAME']
+
+# --- Env DB Configs ---
+os.environ["AWS_REGION"] = "us-east-1"
+os.environ['RDS_DB_NAME'] = "pnc_warehouse"
+os.environ['RDS_REF_DB_NAME'] = "ref_data"
+os.environ['RDS_RAW_DB_NAME'] = "mdm_raw"
+os.environ['RDS_REFINED_DB_NAME'] = "mdm_refined"
+# ... (rest of env vars as before)
+
+pnc_db = os.environ['RDS_DB_NAME']
+ref_db = os.environ['RDS_REF_DB_NAME']
+mdm_raw_db = os.environ['RDS_RAW_DB_NAME']
+mdm_refined_db = os.environ['RDS_REFINED_DB_NAME']
+
+# --- Async Logger Wrapper ---
+async def log_msg(func, **kwargs):
+    await asyncio.to_thread(func, **kwargs)
+
+# (msg_to_sqs and init_sp unchanged for brevity)
+
+# --- Session/Engine Initializer ---
+def call_session_engine(source_system=None, database_name=None):
+
+    rds_secret_name = os.environ["RDS_SECRETS_MANAGER_ID"]
+    region_name = os.environ["AWS_REGION"]
+    rds_host_nm = os.environ['RDS_HOST']
+
+    if database_name == 'ref_data':
+        rds_db_nm = os.environ['RDS_REF_DB_NAME']
+    elif database_name == 'mdm_raw':
+        rds_db_nm = os.environ['RDS_RAW_DB_NAME']
+    elif database_name == 'mdm_refined':
+        rds_db_nm = os.environ['RDS_REFINED_DB_NAME']
+    else:
+        rds_db_nm = os.environ['RDS_DB_NAME']
+
+    if source_system and source_system.lower() == 'as400_aff':
+        as400_secret_name = os.environ["AS400_AFF_SECRETS_MANAGER_ID"]
+        as400_engine = get_as400_db_session(as400_secret_name, region_name)
+        return as400_engine
+
+    elif source_system and source_system.lower() == 'as400_kkins':
+        as400_secret_name = os.environ["AS400_KKINS_SECRETS_MANAGER_ID"]
+        as400_engine = get_as400_db_session(as400_secret_name, region_name)
+        return as400_engine
+
+    if database_name:
+        session = get_rds_db_session(rds_secret_name, region_name, rds_host_nm, rds_db_nm)
+        return session
+
+
+# --- Global Sessions ---
+session = call_session_engine(database_name=pnc_db)
+as400_engine_aff = call_session_engine(source_system='as400_aff')
+as400_engine_kkins = call_session_engine(source_system='as400_kkins')
+as400_engine_attorney = call_session_engine(source_system='as400_attorney')
+
+
+# --- Lookup Customer from AS400 ---
+def lookup_as400_customer_contact(config=None, id=None):
+    """
+    Query AS400 systems (AFF / KKINS) for customer record.
+    You can adjust the column mappings as per AS400 schema.
+    """
+    source_system = config.get("source_system")
+    df = None
+
+    if source_system and source_system.lower() == "as400_aff":
+        df = pd.read_sql(f"""
+            SELECT DISTINCT CASt(NULL AS varchar(36)) AS df_customer_contact_id,
+            cu.CUSKEY AS source_customer_contact_id,
+            CAST(NULL AS varchar(36)) AS df_customer_id,
+            CAST(NULL AS varchar(36)) AS df_source_system_id,
+            CAST(NULL AS varchar(36)) AS mdm_customer_id,
+            CAST(NULL AS timestamp) AS created_date,
+            CAST(NULL AS timestamp) AS modified_date
+            FROM ADGDTADV.NSOCVGP AS pol
+            INNER JOIN ADGDTADV.HCPCSTP AS cust ON pol.customer_no = cust.CUSTNO
+            INNER JOIN ADGDTADV.HCPCUSP cu ON cust.CSTKEY = cu.CUSKEY
+            WHERE pol.POLICY_TYPE = 'I' and cu.CUSKEY = {id};
+        """, con=as400_engine_aff)
+
+    elif source_system and source_system.lower() == "as400_kkins":
+        df = pd.read_sql(f"""
+            SELECT DISTINCT
+                C.CUST_NO AS source_customer_id,
+                C.CUST_NAME AS customer_name,
+                C.DBA_NAME AS dba_name,
+                C.TAX_ID AS tax_number,
+                C.EMAIL AS email,
+                C.ADDR1 AS premises_address_line_1,
+                C.CITY AS premises_city,
+                C.STATE AS premises_state,
+                C.ZIP AS premises_zip,
+                C.PHONE AS premises_phone,
+                C.STATUS AS status,
+                C.CREATED_TS AS created_ts,
+                C.UPDATED_TS AS modified_ts
+            FROM KKINSDB.CUSTOMER C
+            WHERE C.CUST_NO = '{id}'
+        """, con=as400_engine_kkins)
+
+    if df is not None and len(df) > 0:
+        return df.to_dict("records")[0]
+    return None
+
+# --- Core Consumer ---
+async def consume_lambda(config=None):
+
+    print("STEP 1: consume_lambda started")
+    now = datetime.now()
+    start_ts = datetime.timestamp(now)
+
+    try:
+        config_dicts = config if isinstance(config, dict) else json.loads(str(config))
+        if not isinstance(config_dicts, list):
+            config_dicts = [config_dicts]
+
+        print("STEP 2: Processing configs...")
+
+        for config_dict in config_dicts:
+
+            contact_id = config_dict.get("source_customer_contact_id")
+            source_system = config_dict.get("source_system").lower()
+
+            print(f"STEP 2.1: Processing contact_id={contact_id}, source_system={source_system}")
+
+            # Choose AS400 engine
+            if source_system == "as400_aff":
+                as400_engine = as400_engine_aff
+            else:
+                as400_engine = as400_engine_kkins
+
+            # --- AS400 Lookup ---
+            as400_contact = lookup_as400_customer_contact(config_dict, contact_id)
+            print('*********************')
+            print(as400_contact)
+            print('*********************')
+            if not as400_contact:
+                print(f"[ERROR] No AS400 record found for customer_contact={contact_id}")
+                continue
+
+            # --- Map df_source_system_id ---
+            print("STEP 5: Fetching Source_System...")
+            ss = multi_filter_get_record(session, model=Source_System, source_system=source_system)
+            ss_record = ss.first() if ss else None
+
+            if ss_record:
+                as400_contact["df_source_system_id"] = ss_record.df_source_system_id
+            else:
+                print("[ERROR] Source_System not found.")
+                continue
+
+            # --- Map df_customer_id ---
+            print("STEP 6: Fetching Customer...")
+            cust_rec = get_record(
+                session,
+                model=Customer,
+                column_name="source_customer_contact_id",
+                value=as400_contact["source_customer_contact_id"],
+                df_source_system_id=as400_contact["df_source_system_id"]
+            )
+
+            customer = cust_rec.first() if cust_rec else None
+            # if not customer:
+            #     print("[ERROR] Customer not found in MDV DB.")
+            #     continue
+
+            as400_contact["df_customer_id"] = customer.df_customer_id
+
+            # --- Check if customer_contact exists ---
+            print("STEP 7: Checking existing customer_contact...")
+            contact_exists = multi_filter_get_record(
+                session,
+                model=Customer_Contact,
+                source_customer_contact_id=as400_contact["source_customer_contact_id"],
+                df_customer_id=as400_contact["df_customer_id"],
+                df_source_system_id=as400_contact["df_source_system_id"]
+            )
+
+            existing = contact_exists.first() if contact_exists else None
+
+            if not existing:
+                print("STEP 8: Inserting NEW Customer_Contact...")
+
+                uuid_key = (
+                    str(as400_contact["source_customer_contact_id"]) +
+                    str(as400_contact["df_customer_id"]) +
+                    str(as400_contact["df_source_system_id"])
+                )
+
+                as400_contact["df_customer_contact_id"] = generate_uuid(
+                    uuid_key, as400_contact["df_source_system_id"]
+                )
+
+                session.add(Customer_Contact.from_dict(cls=Customer_Contact, d=as400_contact))
+
+            else:
+                print("STEP 8: Updating existing Customer_Contact...")
+                existing.update(query_update_dict(obj=Customer_Contact, dict=as400_contact))
+
+            session.commit()
+            print("STEP 9: Commit successful")
+
+        print(f"STEP 10: Finished ingestion. Total time: {datetime.timestamp(datetime.now()) - start_ts}s")
+
+    except SQLAlchemyError as e:
+        session.rollback()
+        print("[DB ERROR]", str(e))
+        raise e
+
+
+# --- Lambda Handler ---
+def handle(event, context):
+    start_time = time.time()
+    print("Handle function is called for customer_contact ingestion")
+    for record in event['Records']:
+        payload = record["body"]
+        asyncio.run(consume_lambda(config=payload))
+    return {"execution_time_sec": time.time() - start_time}
+
+if __name__ == "__main__":
+    # sample test event (adjust source_system and contact id as needed)
+    test_event = {
+        "Records": [
+            {"body": '{"source_customer_contact_id":"259894467","source_system":"as400_aff"}'}
+        ]
+    }
+    handle(test_event, None)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Handle function is called for customer_contact ingestion
+STEP 1: consume_lambda started
+STEP 2: Processing configs...
+STEP 2.1: Processing contact_id=259894467, source_system=as400_aff
+*********************
+{'df_customer_contact_id': None, 'source_customer_contact_id': 259894467.0, 'df_customer_id': None, 'df_source_system_id': None, 'mdm_customer_id': None, 'created_date': None, 'modified_date': None}
+*********************
+STEP 5: Fetching Source_System...
+STEP 6: Fetching Customer...
+Traceback (most recent call last):
+  File "c:\Users\A0885080\Downloads\Fixed Repo Git\df_sqs_as400_aff_kkins_customercontactconsumer\src\handler.py", line 268, in <module>
+    handle(test_event, None)
+  File "c:\Users\A0885080\Downloads\Fixed Repo Git\df_sqs_as400_aff_kkins_customercontactconsumer\src\handler.py", line 258, in handle
+    asyncio.run(consume_lambda(config=payload))
+  File "C:\Program Files\Python312\Lib\asyncio\runners.py", line 194, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python312\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python312\Lib\asyncio\base_events.py", line 685, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "c:\Users\A0885080\Downloads\Fixed Repo Git\df_sqs_as400_aff_kkins_customercontactconsumer\src\handler.py", line 208, in consume_lambda
+    as400_contact["df_customer_id"] = customer.df_customer_id
+                                      ^^^^^^^^^^^^^^^^^^^^^^^
