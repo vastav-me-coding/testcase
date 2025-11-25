@@ -1,0 +1,384 @@
+import os
+import logging
+import json
+import time
+import requests
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import func, and_,select, BIGINT, create_engine, Column, update, Integer, cast, String, MetaData, DateTime, Float, Text, DECIMAL, TIMESTAMP, text
+from sqlalchemy.orm import Session, declarative_base
+from df_database_models.db_conn import get_rds_db_session, get_aumine_db_session, get_as400_db_session
+from df_database_models.db_conn import *
+from df_database_models.models import Agency, Customer, Agency_Contact, Customer_Contact, Policy, Source_System, Policy_Status, Transaction, Transaction_Type, Policy_Number_Version
+from df_database_models.db_utils import  generate_uuid, convert_timestamps, query_update_dict, policy_version_increment, latest_policy_version, latest_transaction_id, get_record, multi_filter_get_record, push_msg_to_sqs, call_sp
+from df_database_models.db_utils import *
+from df_database_models.db_lookup import generic_product_lookup
+from secrets_manager import get_secret
+from datetime import datetime
+import pandas as pd
+import asyncio
+from adf_pyutils.clm_wrapper import common_logger, generate_response_log_details
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+pnc_db = os.environ['RDS_DB_NAME']
+ref_db = os.environ['RDS_REF_DB_NAME']
+mdm_raw_db = os.environ['RDS_RAW_DB_NAME']
+mdm_refined_db = os.environ['RDS_REFINED_DB_NAME']
+
+## Fetch SQS producer Parameters from aws secret manager
+
+async def log_msg(func,**kwargs):
+    await asyncio.to_thread(func,**kwargs)
+
+def call_session_engine(source_system=None, database_name=None):
+
+    rds_secret_name  = os.environ["RDS_SECRETS_MANAGER_ID"]
+    region_name = os.environ["AWS_REGION"]
+    rds_host_nm = os.environ['RDS_HOST']
+
+    if database_name == 'ref_data':
+        rds_db_nm = os.environ['RDS_REF_DB_NAME']
+    elif database_name == 'mdm_raw':
+        rds_db_nm = os.environ['RDS_RAW_DB_NAME']
+    elif database_name == 'mdm_refined':
+        rds_db_nm = os.environ['RDS_REFINED_DB_NAME']
+    else:
+        rds_db_nm = os.environ['RDS_DB_NAME']
+
+    if source_system and source_system.lower() == 'as400_aff':
+        as400_secret_name = os.environ["AS400_AFF_SECRETS_MANAGER_ID"]
+        as400_engine= get_as400_db_session(as400_secret_name, region_name)
+        return as400_engine
+
+    if database_name:
+        session = get_rds_db_session(rds_secret_name, region_name, rds_host_nm, rds_db_nm)
+        return session
+
+# --- Global Sessions ---
+session = call_session_engine(database_name=pnc_db)
+as400_engine_aff = call_session_engine(source_system='as400_aff')
+
+def lookup_as400_policy(config=None, id=None):
+    source_system = config['source_system']
+    if source_system:
+        if source_system.lower() == 'as400_aff':
+            df = pd.read_sql(f"""
+                SELECT * FROM (
+                    SELECT
+                        ROW_NUMBER() OVER (
+                            PARTITION BY a.ACCOUNT_NO
+                            ORDER BY c.ENDORSEMENT_SEQ_NO DESC
+                        ) AS row_num,
+                        a.ACCOUNT_NO AS policy_number,
+                        c.ENDORSEMENT_NO AS endorsement_number,
+                        c.ENDORSEMENT_SEQ_NO AS endorsement_sequence_number,
+                        CASE
+                            WHEN a.ENTITY_STATUS = 'A' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'T' THEN 'Terminated'
+                            WHEN a.ENTITY_STATUS = 'R' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'P' THEN 'Pending'
+                            WHEN a.ENTITY_STATUS = 'Q' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'Z' THEN 'Terminated'
+                        END AS source_policy_status,
+                        CASE
+                            WHEN a.ENTITY_STATUS = 'A' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'T' THEN 'Terminated'
+                            WHEN a.ENTITY_STATUS = 'R' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'P' THEN 'Pending'
+                            WHEN a.ENTITY_STATUS = 'Q' THEN 'Active'
+                            WHEN a.ENTITY_STATUS = 'Z' THEN 'Terminated'
+                        END AS policy_status,
+                        CASE
+                            WHEN (a.PROFESSION_FLAG IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE = 'I') THEN '71a7b727-0787-4935-a0d0-0704dbcdd711'
+                            WHEN (a.PROFESSION_FLAG IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE != 'I') THEN 'e71ba4fc-afa1-4396-a8ef-c7a22765adb8'
+                            WHEN (a.PROFESSION_FLAG NOT IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE != 'I') THEN '2bd40533-6f37-4239-bfbf-8f22feddbb2e'
+                            WHEN (a.PROFESSION_FLAG NOT IN ('NUR','PAS','PNM','CNS','CRN') AND a.POLICY_TYPE = 'I') THEN 'f84e4b29-8069-45b5-8e46-835cf590a569'
+                            WHEN a.POLICY_TYPE = 'U' THEN '5b0f4296-767c-4196-bd10-d13d2fc68ad8'
+                        END AS product_id,
+                        LTRIM(RTRIM(a.SUBPROD_NO)) AS source_agency_id,
+                        a.CUSTOMER_NO AS source_customer_id,
+                        a.POLICY_EFF_DATE AS effective_date,
+                        a.POLICY_EXP_DATE AS expiration_date,
+                        b.POLICY_ISSUE_DATE AS policy_issue_date,
+                        'AS400_AFFPRD' AS source_system
+                    FROM [ADGDTADV].[NSOCVGP] a
+                    INNER JOIN [ADGDTADV].[ADGACIP] b ON a.CUSTOMER_NO = b.CUSTOMER_NO
+                    INNER JOIN [ADGDTADV].[HCPCVEP] c 
+                        ON a.CUSTOMER_NO = c.CUSTOMER_NO 
+                        AND a.POLICY_EFF_DATE = c.EFFECTIVE_DATE
+                        AND a.POLICY_EXP_DATE = c.TERMIN_DATE
+                    WHERE a.POLICY_EFF_DATE <= CONVERT(char(8), GETDATE(), 112)
+                    AND a.POLICY_EXP_DATE > CONVERT(char(8), GETDATE(), 112)
+                    AND a.ENTITY_STATUS = 'A'
+                ) ab
+                WHERE row_num = 1 AND {"source_customer_id" if "source_customer_id" in config else "policy_number"} = {id}
+            """, con=as400_engine_aff)
+
+    else:
+        df=None     
+        
+    if(len(df)>0):
+        return df.to_dict('records')[0]
+    else:
+        return None
+
+async def consume_lambda(config=None):
+    now = datetime.now()
+    start_timestamp = datetime.timestamp(now)
+    asyncio.create_task(log_msg(logger, log_messages=f'Processing AS400 Policy @ {now}'))
+
+    try:
+        config_dicts = config if isinstance(config, list) else [json.loads(config)] if isinstance(config, str) else [config]
+        for config_dict in config_dicts:
+            id = config_dict.get("source_policy_id") if "source_policy_id" in config_dict else config_dict.get("source_customer_id")
+            source_system = config_dict.get("source_system").lower()
+
+            asyncio.create_task(log_msg(logger, log_messages=f'Invoking handler for {source_system} policy {id}'))
+            if not id:
+                continue
+
+            # global as400_engine
+            # as400_engine = as400_engine_aff if source_system == 'as400_aff' else as400_engine_kkins
+
+            as400_policy_dict = lookup_as400_policy(config=config_dict, id=id)
+            if not as400_policy_dict:
+                asyncio.create_task(log_msg(logger, log_messages=f'No AS400 policy record found for {id}'))
+                continue
+
+            print(as400_policy_dict)
+            asyncio.create_task(log_msg(logger, log_messages=f'AS400 Policy Data Fetched', api_response=convert_timestamps(as400_policy_dict)))
+
+            # --- FK Lookups ---
+            if "source_system" in as400_policy_dict:
+                src_sys_rec = get_record(session, model=Source_System, column_name="source_system", value=as400_policy_dict.get("source_system", None)).first()
+                if src_sys_rec:
+                    as400_policy_dict["df_source_system_id"] = src_sys_rec.df_source_system_id
+
+            if "policy_status" in as400_policy_dict:
+                policy_status_rec = get_record(session, model=Policy_Status, column_name="policy_status", value=as400_policy_dict.get("policy_status", None)).first()
+                if policy_status_rec:
+                    as400_policy_dict["df_policy_status_id"] = policy_status_rec.df_policy_status_id
+
+            if "transaction_type" in as400_policy_dict:
+                txn_type_rec = get_record(session, model=Transaction_Type, column_name="transaction_type", value=as400_policy_dict.get("transaction_type", None)).first()
+                if txn_type_rec:
+                    as400_policy_dict["df_transaction_type_id"] = txn_type_rec.df_transaction_type_id
+
+            # --- Agency/Customer Entities ---
+            src_agency_id = as400_policy_dict.get("source_agency_id")
+            src_customer_id = as400_policy_dict.get("source_customer_id")
+            df_source_system_id = as400_policy_dict.get("df_source_system_id")
+
+            agency_record = (query.first() if (query := multi_filter_get_record(session, model=Agency, source_agency_id=src_agency_id, df_source_system_id=df_source_system_id)) else None)
+            customer_record = (query.first() if (query := multi_filter_get_record(session, model=Customer, source_customer_id=src_customer_id, df_source_system_id=df_source_system_id)) else None)
+
+            if agency_record:
+                as400_policy_dict['df_agency_id'] = agency_record.df_agency_id
+            else:
+                as400_policy_dict['df_agency_id'] = generate_uuid(str(src_agency_id or ''), str(df_source_system_id))
+                session.add(Agency.from_dict(cls=Agency, d=as400_policy_dict))
+                session.commit()
+
+            if customer_record:
+                as400_policy_dict['df_customer_id'] = customer_record.df_customer_id
+            else:
+                df_customer_id = generate_uuid(str(src_customer_id or ''), str(df_source_system_id))
+                as400_policy_dict['df_customer_id'] = df_customer_id
+
+                # Double check if this UUID already exist in DB
+                existing_uuid = session.query(Customer).filter(
+                    Customer.df_customer_id == df_customer_id
+                ).first()
+                if not existing_uuid:
+                    session.add(Customer.from_dict(cls=Customer, d=as400_policy_dict))
+                    session.commit()
+                    asyncio.create_task(log_msg(logger, log_messages=f'Inserted customer {src_customer_id}'))
+                else:
+                    logger.info(f"Customer already exist with df_customer_id {existing_uuid.df_customer_id}")
+                    
+            # --- Policy Upsert ---
+            policy_record = multi_filter_get_record(session, model=Policy,
+                                                    policy_number=as400_policy_dict["policy_number"],
+                                                    df_source_system_id=df_source_system_id)
+            existing_policy = policy_record.first() if policy_record else None
+
+            if not existing_policy:
+                df_policy_id = generate_uuid(str(as400_policy_dict["policy_number"]), str(df_source_system_id))
+                as400_policy_dict["df_policy_id"] = df_policy_id
+
+                # Double check if this UUID already exist in DB
+                existing_uuid_policy = session.query(Policy).filter(
+                    Policy.df_policy_id == df_policy_id
+                ).first()
+                if not existing_uuid_policy:
+                    session.add(Policy.from_dict(cls=Policy, d=as400_policy_dict))
+                    session.commit()
+                    asyncio.create_task(log_msg(logger, log_messages=f'Inserted Policy {id}'))
+                else:
+                    logger.info(f"Policy already exist with df_customer_id {existing_uuid_policy.df_policy_id}")
+            else:
+                as400_policy_dict["df_policy_id"] = existing_policy.df_policy_id
+                policy_record.update(query_update_dict(obj=Policy, dict=as400_policy_dict))
+                asyncio.create_task(log_msg(logger, log_messages=f'Updated Policy {id}'))
+
+            # --- Policy Version ---
+            df_policy_id = as400_policy_dict['df_policy_id']
+            policy_version = multi_filter_get_record(session, model=Policy_Number_Version,
+                                                     policy_number=as400_policy_dict["policy_number"])
+            existing_version = policy_version.first() if policy_version else None
+
+            if not existing_version:
+                version_number = policy_version_increment(None)
+                df_policy_number_version_id = generate_uuid(
+                    str(as400_policy_dict["policy_number"]) + str(df_policy_id),
+                    str(df_source_system_id)
+                )
+                as400_policy_dict['df_policy_number_version_id'] = df_policy_number_version_id
+                as400_policy_dict['policy_version_number'] = version_number
+                as400_policy_dict['policy_effective_date'] = as400_policy_dict['effective_date']
+                as400_policy_dict['policy_expiration_date'] = as400_policy_dict['expiration_date']
+                as400_policy_dict['is_latest'] = 1
+
+                existing_uuid_policy_version = session.query(Policy_Number_Version).filter(
+                    Policy_Number_Version.df_policy_id == df_policy_id
+                ).first()
+
+                if not existing_uuid_policy_version:
+                    session.add(Policy_Number_Version.from_dict(cls=Policy_Number_Version, d=as400_policy_dict))
+                    session.commit()
+                    asyncio.create_task(log_msg(logger, log_messages=f'Inserted Policy Version {id}'))
+                else:
+                    logger.info(f"Policy version already exist with df_policy_id {existing_uuid_policy_version.df_policy_id}")
+            else:
+                policy_version.update(query_update_dict(obj=Policy_Number_Version, dict=as400_policy_dict))
+                asyncio.create_task(log_msg(logger, log_messages=f'Updated Policy Version {id}'))
+
+        end_timestamp = datetime.timestamp(datetime.now())
+        return {'execution_time_sec': end_timestamp - start_timestamp}
+
+    except SQLAlchemyError as e:
+        session.rollback()
+        asyncio.create_task(log_msg(logger, log_messages='DB Error', api_response=str(e)))
+        raise e
+
+def handle(event, context):
+    start_time = time.time()
+    for record in event['Records']:
+        logger.info(record)
+        payload = record["body"]
+        asyncio.run(consume_lambda(config=payload))
+
+    end_time = time.time()
+
+    return {
+        "execution_time_sec": end_time - start_time 
+    }
+
+
+if __name__ == '__main__':
+    # handle({'Records': [{'body': '{"source_policy_id":"1003093977","event_type":"INSERT/DELETE"}'}]}, None)
+    handle({'Records': [{'body': '[{ "source_policy_id": "2002569486", "parent_policy_id": "2002254485", "policy_type": "renewal"}]'}]}, None)
+    # handle({'Records': [{'body': '[{"source_policy_id":"2002573640"},{"source_policy_id":"2002573647"},{"source_policy_id":"2002573649"}]'}]}, None)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[INFO]	2025-11-25T12:07:33.351Z	64068c9f-6246-5539-b352-ed00ff7ac3e6	{'messageId': 'a6949db5-1d27-4f26-b8c4-8de7871763e4', 'receiptHandle': 'AQEBIuubFTrNmjR3FpZtqB9VNk80vRKKEx52P2yKBPkqoLCi+Pm+DEHN33ywHEFJJpEtv/W9sslbeoprIySIJAqbFCXtRKCsAGFuy68Q6iiTGAVoenMTyfxQrKKN51+SBr7A4xquBXZdfPbOckvOnG37oKy5OhdSy7vv+J3C2mMF+wHnLSJ27Zy55dbCYZ0XtGtHK7UNjbxq7wMcAAe7cxZWnmVjR/mbtevmGNGjCWX7GuzHjfAzcf7oe0TyLzN0SDAllEK+K8WWrgz8sPKXnB19upI1v9BB5SLMIwbjAiXs91QMoq4TjdvMr7jyt/vwq8NsWtXU4py3pbZk1UMwbFfJalIyv0S+JCIV1vpAS2PMOASRQOSGMzHVNKhyDeYtTqutiNwzW6rLTQ9tVDqBYyXcpnNNkD+vEKV4ev098mhb5mU3TljpEXjEMLAwdvI/dVqL', 'body': '{"source_system": "as400_aff", "source_customer_id": "472521534"}', 'attributes': {'ApproximateReceiveCount': '1', 'AWSTraceHeader': 'Root=1-6923d6ea-8ce3d2c0d2ebf9e2a5180a43;Parent=4a470e3e3b60fdd0;Sampled=0;Lineage=1:f3991287:0', 'SentTimestamp': '1763956479386', 'SenderId': 'AROA6DGB54JXCWIRH5J4R:affinity-tds-ar4262-dv001-df-das-sqs-processor', 'ApproximateFirstReceiveTimestamp': '1764072188409'}, 'messageAttributes': {}, 'md5OfBody': '5988fed5485d2fe57d97f5a2d814805d', 'eventSource': 'aws:sqs', 'eventSourceARN': 'arn:aws:sqs:us-east-1:968921834094:affinity-tds-ar4262-dv001-df-sqs-as400-aff-kkins-policy', 'awsRegion': 'us-east-1'}
+{'row_num': 1, 'policy_number': 430366179.0, 'endorsement_number': 'CNA101580   ', 'endorsement_sequence_number': 2.0, 'source_policy_status': 'Active', 'policy_status': 'Active', 'product_id': 'f84e4b29-8069-45b5-8e46-835cf590a569', 'source_agency_id': '3390', 'source_customer_id': 472521534.0, 'effective_date': 20251125.0, 'expiration_date': 20261125.0, 'policy_issue_date': 20251123.0, 'source_system': 'AS400_AFFPRD'}
+[WARNING]	2025-11-25T12:09:49.066Z	64068c9f-6246-5539-b352-ed00ff7ac3e6	LAMBDA_WARNING: Unhandled exception. The most likely cause is an issue in the function code. However, in rare cases, a Lambda runtime update can cause unexpected function behavior. For functions using managed runtimes, runtime updates can be triggered by a function change, or can be applied automatically. To determine if the runtime has been updated, check the runtime version in the INIT_START log entry. If this error correlates with a change in the runtime version, you may be able to mitigate this error by temporarily rolling back to the previous runtime version. For more information, see https://docs.aws.amazon.com/lambda/latest/dg/runtimes-update.html
+[ERROR] IntegrityError: (pymysql.err.IntegrityError) (1062, "Duplicate entry '3e6d2a7b-da53-5869-89f6-ff9c6540514e' for key 'customer.PRIMARY'")
+[SQL: INSERT INTO customer (df_customer_id, source_customer_id, df_source_system_id, mdm_customer_id) VALUES (%(df_customer_id)s, %(source_customer_id)s, %(df_source_system_id)s, customer.mdm_customer_id)]
+[parameters: {'df_customer_id': '3e6d2a7b-da53-5869-89f6-ff9c6540514e', 'source_customer_id': 472521534.0, 'df_source_system_id': 2}]
+(Background on this error at: https://sqlalche.me/e/20/gkpj)
+Traceback (most recent call last):
+  File "/var/task/handler.py", line 270, in handle
+    asyncio.run(consume_lambda(config=payload))
+  File "/var/lang/lib/python3.12/asyncio/runners.py", line 195, in run
+    return runner.run(main)
+  File "/var/lang/lib/python3.12/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+  File "/var/lang/lib/python3.12/asyncio/base_events.py", line 691, in run_until_complete
+    return future.result()
+  File "/var/task/handler.py", line 263, in consume_lambda
+    raise e
+  File "/var/task/handler.py", line 195, in consume_lambda
+    session.commit()
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/orm/session.py", line 2032, in commit
+    trans.commit(_to_root=True)
+  File "<string>", line 2, in commit
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/orm/state_changes.py", line 139, in _go
+    ret_value = fn(self, *arg, **kw)
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/orm/session.py", line 1313, in commit
+    self._prepare_impl()
+  File "<string>", line 2, in _prepare_impl
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/orm/state_changes.py", line 139, in _go
+    ret_value = fn(self, *arg, **kw)
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/orm/session.py", line 1288, in _prepare_impl
+    self.session.flush()
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/orm/session.py", line 4345, in flush
+    self._flush(objects)
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/orm/session.py", line 4480, in _flush
+    with util.safe_reraise():
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/util/langhelpers.py", line 224, in __exit__
+    raise exc_value.with_traceback(exc_tb)
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/orm/session.py", line 4441, in _flush
+    flush_context.execute()
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/orm/unitofwork.py", line 466, in execute
+    rec.execute(self)
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/orm/unitofwork.py", line 642, in execute
+    util.preloaded.orm_persistence.save_obj(
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/orm/persistence.py", line 93, in save_obj
+    _emit_insert_statements(
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/orm/persistence.py", line 1227, in _emit_insert_statements
+    result = connection.execute(
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/engine/base.py", line 1415, in execute
+    return meth(
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/sql/elements.py", line 523, in _execute_on_connection
+    return connection._execute_clauseelement(
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/engine/base.py", line 1637, in _execute_clauseelement
+    ret = self._execute_context(
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/engine/base.py", line 1842, in _execute_context
+    return self._exec_single_context(
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/engine/base.py", line 1982, in _exec_single_context
+    self._handle_dbapi_exception(
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/engine/base.py", line 2351, in _handle_dbapi_exception
+    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/engine/base.py", line 1963, in _exec_single_context
+    self.dialect.do_execute(
+  File "/var/lang/lib/python3.12/site-packages/sqlalchemy/engine/default.py", line 943, in do_execute
+    cursor.execute(statement, parameters)
+  File "/var/lang/lib/python3.12/site-packages/pymysql/cursors.py", line 153, in execute
+    result = self._query(query)
+  File "/var/lang/lib/python3.12/site-packages/pymysql/cursors.py", line 322, in _query
+    conn.query(q)
+  File "/var/lang/lib/python3.12/site-packages/pymysql/connections.py", line 563, in query
+    self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+  File "/var/lang/lib/python3.12/site-packages/pymysql/connections.py", line 825, in _read_query_result
+    result.read()
+  File "/var/lang/lib/python3.12/site-packages/pymysql/connections.py", line 1199, in read
+    first_packet = self.connection._read_packet()
+  File "/var/lang/lib/python3.12/site-packages/pymysql/connections.py", line 775, in _read_packet
+    packet.raise_for_error()
+  File "/var/lang/lib/python3.12/site-packages/pymysql/protocol.py", line 219, in raise_for_error
+    err.raise_mysql_exception(self._data)
+  File "/var/lang/lib/python3.12/site-packages/pymysql/err.py", line 150, in raise_mysql_exception
+    raise errorclass(errno, errval)
+END RequestId: 64068c9f-6246-5539-b352-ed00ff7ac3e6
